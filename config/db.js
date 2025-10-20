@@ -1,4 +1,3 @@
-// src/config/db.js
 require('dotenv').config();
 const mysql = require('mysql2/promise');
 const { URL } = require('url');
@@ -23,13 +22,16 @@ function getDbConfigFromEnv() {
     CONNECTION_TIMEOUT = 10000
   } = process.env;
 
+  // ✅ If DATABASE_URL exists, parse it (Render / Aiven style)
   if (DATABASE_URL) {
     const dbUrl = new URL(DATABASE_URL);
     const sslMode =
       dbUrl.searchParams.get('sslmode') || dbUrl.searchParams.get('ssl-mode');
+
+    // ✅ Aiven & Render use self-signed certs → allow SSL but disable strict validation
     const ssl =
       sslMode && sslMode.toLowerCase().startsWith('req')
-        ? { rejectUnauthorized: true }
+        ? { rejectUnauthorized: false }
         : undefined;
 
     return {
@@ -47,6 +49,7 @@ function getDbConfigFromEnv() {
     };
   }
 
+  // Manual .env variables fallback (for local dev)
   if (DB_HOST && DB_USER && DB_PASSWORD && DB_NAME) {
     const host = DB_HOST === 'localhost' ? '127.0.0.1' : DB_HOST;
     return {
@@ -173,7 +176,7 @@ async function getChargeForAmount(dbClient, amount) {
 async function initializeDatabase() {
   const db = await getPool();
 
-  // users
+  // USERS TABLE
   await db.query(`
     CREATE TABLE IF NOT EXISTS users (
       id INT PRIMARY KEY AUTO_INCREMENT,
@@ -198,6 +201,7 @@ async function initializeDatabase() {
     await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TIMESTAMP NULL DEFAULT NULL AFTER updated_at;`);
   } catch (e) {}
 
+  // ADMIN BALANCE
   await db.query(`
     CREATE TABLE IF NOT EXISTS admin_balance (
       id TINYINT PRIMARY KEY,
@@ -212,32 +216,32 @@ async function initializeDatabase() {
     ON DUPLICATE KEY UPDATE id = id;
   `);
 
-  // matches: ensure board default matches 6x6
+  // MATCHES
   await db.query(`
     CREATE TABLE IF NOT EXISTS matches (
-  id INT PRIMARY KEY AUTO_INCREMENT,
-  creator_id INT NOT NULL,
-  opponent_id INT DEFAULT NULL,
-  board CHAR(36) NOT NULL DEFAULT '____________________________________', -- 36 underscores (6x6)
-  current_turn ENUM('X','O') NOT NULL DEFAULT 'X',
-  status ENUM('waiting','playing','finished','cancelled') DEFAULT 'waiting',
-  winner ENUM('creator','opponent','draw') DEFAULT NULL,
-  bet_amount DECIMAL(14,2) DEFAULT 0.00,
-  creator_display_name VARCHAR(255) DEFAULT NULL,
-  creator_username VARCHAR(255) DEFAULT NULL,
-  opponent_display_name VARCHAR(255) DEFAULT NULL,
-  opponent_username VARCHAR(255) DEFAULT NULL,
-  creator_is_bot TINYINT(1) DEFAULT 0,
-  opponent_is_bot TINYINT(1) DEFAULT 0,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  FOREIGN KEY (creator_id) REFERENCES users(id) ON DELETE CASCADE,
-  FOREIGN KEY (opponent_id) REFERENCES users(id) ON DELETE SET NULL,
-  INDEX (creator_id), INDEX (opponent_id), INDEX (status)
-  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+      id INT PRIMARY KEY AUTO_INCREMENT,
+      creator_id INT NOT NULL,
+      opponent_id INT DEFAULT NULL,
+      board CHAR(36) NOT NULL DEFAULT '____________________________________',
+      current_turn ENUM('X','O') NOT NULL DEFAULT 'X',
+      status ENUM('waiting','playing','finished','cancelled') DEFAULT 'waiting',
+      winner ENUM('creator','opponent','draw') DEFAULT NULL,
+      bet_amount DECIMAL(14,2) DEFAULT 0.00,
+      creator_display_name VARCHAR(255) DEFAULT NULL,
+      creator_username VARCHAR(255) DEFAULT NULL,
+      opponent_display_name VARCHAR(255) DEFAULT NULL,
+      opponent_username VARCHAR(255) DEFAULT NULL,
+      creator_is_bot TINYINT(1) DEFAULT 0,
+      opponent_is_bot TINYINT(1) DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      FOREIGN KEY (creator_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY (opponent_id) REFERENCES users(id) ON DELETE SET NULL,
+      INDEX (creator_id), INDEX (opponent_id), INDEX (status)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
   `);
 
-  // bets
+  // BETS
   await db.query(`
     CREATE TABLE IF NOT EXISTS bets (
       id BIGINT PRIMARY KEY AUTO_INCREMENT,
@@ -254,25 +258,24 @@ async function initializeDatabase() {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
   `);
 
-  // moves: position range 0..BOARD_CELLS-1
+  // MOVES
   await db.query(`
     CREATE TABLE IF NOT EXISTS moves (
-  id BIGINT PRIMARY KEY AUTO_INCREMENT,
-  match_id INT NOT NULL,
-  user_id INT NOT NULL,
-  position TINYINT NOT NULL,
-  symbol ENUM('X','O') NOT NULL,
-  display_name VARCHAR(255) DEFAULT NULL,
-  played_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (match_id) REFERENCES matches(id) ON DELETE CASCADE,
-  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-  UNIQUE KEY unique_move_per_position (match_id, position),
-  INDEX (match_id), INDEX (user_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
+      id BIGINT PRIMARY KEY AUTO_INCREMENT,
+      match_id INT NOT NULL,
+      user_id INT NOT NULL,
+      position TINYINT NOT NULL,
+      symbol ENUM('X','O') NOT NULL,
+      display_name VARCHAR(255) DEFAULT NULL,
+      played_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (match_id) REFERENCES matches(id) ON DELETE CASCADE,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+      UNIQUE KEY unique_move_per_position (match_id, position),
+      INDEX (match_id), INDEX (user_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
   `);
 
-  // balance_transactions
+  // BALANCE TRANSACTIONS
   await db.query(`
     CREATE TABLE IF NOT EXISTS balance_transactions (
       id BIGINT PRIMARY KEY AUTO_INCREMENT,
@@ -289,7 +292,7 @@ async function initializeDatabase() {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
   `);
 
-  // charge_rates
+  // CHARGE RATES
   await db.query(`
     CREATE TABLE IF NOT EXISTS charge_rates (
       min_amount DECIMAL(14,2) NOT NULL,
@@ -324,7 +327,7 @@ async function initializeDatabase() {
     }
   } catch (e) {}
 
-  // withdrawals
+  // WITHDRAWALS
   await db.query(`
     CREATE TABLE IF NOT EXISTS withdrawals (
       id BIGINT PRIMARY KEY AUTO_INCREMENT,
@@ -341,7 +344,7 @@ async function initializeDatabase() {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
   `);
 
-  // promotional_fees
+  // PROMOTIONAL FEES
   await db.query(`
     CREATE TABLE IF NOT EXISTS promotional_fees (
       id INT PRIMARY KEY AUTO_INCREMENT,
@@ -355,7 +358,7 @@ async function initializeDatabase() {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
   `);
 
-  // migrations
+  // MIGRATIONS
   await db.query(`
     CREATE TABLE IF NOT EXISTS migrations (
       id INT PRIMARY KEY AUTO_INCREMENT,
@@ -365,7 +368,7 @@ async function initializeDatabase() {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
   `);
 
-  // default admin seed if users empty
+  // DEFAULT ADMIN SEED
   try {
     const [rows] = await db.query(`SELECT COUNT(*) as cnt FROM users`);
     if (rows && rows.length && rows[0].cnt === 0) {
@@ -381,6 +384,7 @@ async function initializeDatabase() {
   console.log('✅ Betting DB and tables initialized (6x6 board support)');
 }
 
+// CLEANUP AND POOL MANAGEMENT
 async function closePool() {
   if (pool) {
     try {
@@ -392,7 +396,6 @@ async function closePool() {
   }
 }
 
-/* Cleanup configuration unchanged */
 const CLEANUP_INTERVAL_MS = Number(process.env.DB_CLEANUP_INTERVAL_MS || 5 * 60 * 1000);
 const HISTORY_TTL_HOURS = Number(process.env.DB_HISTORY_TTL_HOURS || 1);
 
@@ -457,12 +460,10 @@ module.exports = {
   getChargeForAmount,
   closePool,
   UPLOAD_FEE_IDENTIFIER,
-  // board constants (exported so model/controller can import if needed)
   BOARD_ROWS,
   BOARD_COLS,
   BOARD_CELLS,
   EMPTY_BOARD,
-  // cleanup helpers
   startCleanupTask,
   stopCleanupTask
 };

@@ -22,16 +22,14 @@ function getDbConfigFromEnv() {
     CONNECTION_TIMEOUT = 10000
   } = process.env;
 
-  // ✅ If DATABASE_URL exists, parse it (Render / Aiven style)
   if (DATABASE_URL) {
     const dbUrl = new URL(DATABASE_URL);
     const sslMode =
       dbUrl.searchParams.get('sslmode') || dbUrl.searchParams.get('ssl-mode');
 
-    // ✅ Aiven & Render use self-signed certs → allow SSL but disable strict validation
     const ssl =
       sslMode && sslMode.toLowerCase().startsWith('req')
-        ? { rejectUnauthorized: false }
+        ? { rejectUnauthorized: false } // ✅ allow self-signed certs
         : undefined;
 
     return {
@@ -49,7 +47,6 @@ function getDbConfigFromEnv() {
     };
   }
 
-  // Manual .env variables fallback (for local dev)
   if (DB_HOST && DB_USER && DB_PASSWORD && DB_NAME) {
     const host = DB_HOST === 'localhost' ? '127.0.0.1' : DB_HOST;
     return {
@@ -117,7 +114,7 @@ async function getPool() {
     connectionLimit: cfg.connectionLimit ?? 10,
     queueLimit: cfg.queueLimit ?? 0,
     timezone: 'Z',
-    connectTimeout: cfg.connectTimeout,
+    connectTimeout: cfg.connectTimeout
   };
 
   if (cfg.socketPath) poolOptions.socketPath = cfg.socketPath;
@@ -162,7 +159,7 @@ async function getChargeForAmount(dbClient, amount) {
     }
 
     return parseFloat((am * PERCENT_FALLBACK).toFixed(2));
-  } catch (err) {
+  } catch {
     if (am < MIN_AMOUNT_THRESHOLD) return parseFloat(MIN_FEE_FOR_SMALL.toFixed(2));
     if (am > MAX_BAND_UPPER) {
       const pct = parseFloat((am * PERCENT_FALLBACK).toFixed(2));
@@ -176,7 +173,7 @@ async function getChargeForAmount(dbClient, amount) {
 async function initializeDatabase() {
   const db = await getPool();
 
-  // USERS TABLE
+  // USERS TABLE (✅ includes bank_name/account fields)
   await db.query(`
     CREATE TABLE IF NOT EXISTS users (
       id INT PRIMARY KEY AUTO_INCREMENT,
@@ -188,6 +185,9 @@ async function initializeDatabase() {
       bot_type ENUM('obvious','simulation') DEFAULT NULL,
       balance DECIMAL(14,2) DEFAULT 0.00,
       pending_balance DECIMAL(14,2) DEFAULT 0.00,
+      bank_name VARCHAR(255) DEFAULT NULL,
+      account_number VARCHAR(50) DEFAULT NULL,
+      account_name VARCHAR(255) DEFAULT NULL,
       role ENUM('user','admin') DEFAULT 'user',
       status ENUM('active','banned','inactive') DEFAULT 'active',
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -197,9 +197,19 @@ async function initializeDatabase() {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
   `);
 
-  try {
-    await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TIMESTAMP NULL DEFAULT NULL AFTER updated_at;`);
-  } catch (e) {}
+  // AUTH TOKENS (✅ added)
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS auth_tokens (
+      id BIGINT PRIMARY KEY AUTO_INCREMENT,
+      user_id INT NOT NULL,
+      token VARCHAR(512) NOT NULL,
+      expires_at DATETIME NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+      UNIQUE KEY uniq_token (token),
+      INDEX (user_id), INDEX (expires_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+  `);
 
   // ADMIN BALANCE
   await db.query(`
@@ -302,30 +312,26 @@ async function initializeDatabase() {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
   `);
 
-  try {
-    const seedBands = [
-      [10.00, 1000.00, 20.00],
-      [1000.01, 5000.00, 50.00],
-      [5000.01, 20000.00, 200.00],
-      [20000.01, 100000.00, 1000.00],
-      [100000.01, 500000.00, 5000.00],
-      [500000.01, 1000000.00, 10000.00],
-      [1000000.01, 5000000.00, 50000.00],
-      [5000000.01, 10000000.00, 100000.00],
-      [10000000.01, 50000000.00, 500000.00],
-      [50000000.01, 100000000.00, 1000000.00],
-      [100000000.01, 500000000.00, 5000000.00]
-    ];
+  // SEED CHARGE RATES
+  const seedBands = [
+    [10.00, 1000.00, 20.00],
+    [1000.01, 5000.00, 50.00],
+    [5000.01, 20000.00, 200.00],
+    [20000.01, 100000.00, 1000.00],
+    [100000.01, 500000.00, 5000.00],
+    [500000.01, 1000000.00, 10000.00],
+    [1000000.01, 5000000.00, 50000.00],
+    [5000000.01, 10000000.00, 100000.00]
+  ];
 
-    for (const [minA, maxA, feeA] of seedBands) {
-      await db.query(
-        `INSERT INTO charge_rates (min_amount, max_amount, fee_amount)
-         VALUES (?, ?, ?)
-         ON DUPLICATE KEY UPDATE fee_amount = VALUES(fee_amount)`,
-        [minA, maxA, feeA]
-      );
-    }
-  } catch (e) {}
+  for (const [minA, maxA, feeA] of seedBands) {
+    await db.query(
+      `INSERT INTO charge_rates (min_amount, max_amount, fee_amount)
+       VALUES (?, ?, ?)
+       ON DUPLICATE KEY UPDATE fee_amount = VALUES(fee_amount)`,
+      [minA, maxA, feeA]
+    );
+  }
 
   // WITHDRAWALS
   await db.query(`
@@ -368,87 +374,17 @@ async function initializeDatabase() {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
   `);
 
-  // DEFAULT ADMIN SEED
-  try {
-    const [rows] = await db.query(`SELECT COUNT(*) as cnt FROM users`);
-    if (rows && rows.length && rows[0].cnt === 0) {
-      const defaultPasswordHash = '';
-      await db.query(
-        `INSERT INTO users (username, email, password_hash, display_name, role, balance)
-         VALUES (?, ?, ?, ?, 'admin', 0.00)`,
-        ['admin', null, defaultPasswordHash, 'Administrator']
-      );
-    }
-  } catch (e) {}
-
-  console.log('✅ Betting DB and tables initialized (6x6 board support)');
+  console.log('✅ Database and tables initialized successfully');
 }
 
-// CLEANUP AND POOL MANAGEMENT
 async function closePool() {
   if (pool) {
     try {
       await pool.end();
-    } catch (e) {}
+    } catch {}
     finally {
       pool = null;
     }
-  }
-}
-
-const CLEANUP_INTERVAL_MS = Number(process.env.DB_CLEANUP_INTERVAL_MS || 5 * 60 * 1000);
-const HISTORY_TTL_HOURS = Number(process.env.DB_HISTORY_TTL_HOURS || 1);
-
-let cleanupTimer = null;
-
-async function runCleanupOnce() {
-  if (!pool) pool = await getPool();
-  if (!pool) return;
-
-  const conn = await pool.getConnection();
-  try {
-    await conn.beginTransaction();
-    const ttlExpr = `NOW() - INTERVAL ${Number(HISTORY_TTL_HOURS)} HOUR`;
-
-    await conn.query(`DELETE FROM balance_transactions WHERE created_at < ${ttlExpr}`);
-    await conn.query(
-      `DELETE mv FROM moves mv
-       JOIN matches m ON mv.match_id = m.id
-       WHERE m.status IN ('finished','cancelled') AND mv.played_at < ${ttlExpr}`
-    );
-    await conn.query(
-      `DELETE b FROM bets b
-       JOIN matches m ON b.match_id = m.id
-       WHERE m.status IN ('finished','cancelled') AND b.placed_at < ${ttlExpr}`
-    );
-    await conn.query(`DELETE FROM matches WHERE status IN ('finished','cancelled') AND created_at < ${ttlExpr}`);
-
-    await conn.commit();
-  } catch (e) {
-    await conn.rollback().catch(() => {});
-    console.error('[dbCleanup] cleanup query error', e && e.stack ? e.stack : e);
-  } finally {
-    try { conn.release(); } catch (_) {}
-  }
-}
-
-function startCleanupTask() {
-  if (cleanupTimer) return;
-  (async () => {
-    try {
-      if (!pool) pool = await getPool();
-      runCleanupOnce().catch(() => {});
-      cleanupTimer = setInterval(() => runCleanupOnce().catch(() => {}), CLEANUP_INTERVAL_MS);
-    } catch (err) {
-      console.error('[dbCleanup] could not start cleanup task', err && err.stack ? err.stack : err);
-    }
-  })();
-}
-
-function stopCleanupTask() {
-  if (cleanupTimer) {
-    clearInterval(cleanupTimer);
-    cleanupTimer = null;
   }
 }
 
@@ -463,7 +399,5 @@ module.exports = {
   BOARD_ROWS,
   BOARD_COLS,
   BOARD_CELLS,
-  EMPTY_BOARD,
-  startCleanupTask,
-  stopCleanupTask
+  EMPTY_BOARD
 };

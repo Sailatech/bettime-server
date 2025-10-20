@@ -4,70 +4,49 @@ const { URL } = require('url');
 
 const UPLOAD_FEE_IDENTIFIER = -1;
 
-// Board config for 6x6, 3-in-a-row
+// === GAME BOARD CONFIG ===
 const BOARD_ROWS = 6;
 const BOARD_COLS = 6;
 const BOARD_CELLS = BOARD_ROWS * BOARD_COLS;
 const EMPTY_BOARD = '_'.repeat(BOARD_CELLS);
 
+/**
+ * Parse database connection details from DATABASE_URL or environment vars
+ */
 function getDbConfigFromEnv() {
-  const {
-    DATABASE_URL,
-    DB_HOST,
-    DB_USER,
-    DB_PASSWORD,
-    DB_NAME,
-    DB_PORT = 3306,
-    SOCKET_PATH,
-    CONNECTION_TIMEOUT = 10000
-  } = process.env;
+  const { DATABASE_URL, CONNECTION_TIMEOUT = 10000 } = process.env;
 
-  if (DATABASE_URL) {
-    const dbUrl = new URL(DATABASE_URL);
-    const sslMode =
-      dbUrl.searchParams.get('sslmode') || dbUrl.searchParams.get('ssl-mode');
-
-    const ssl =
-      sslMode && sslMode.toLowerCase().startsWith('req')
-        ? { rejectUnauthorized: false } // ✅ allow self-signed certs
-        : undefined;
-
-    return {
-      host: dbUrl.hostname,
-      port: Number(dbUrl.port) || 3306,
-      user: dbUrl.username,
-      password: dbUrl.password,
-      database: dbUrl.pathname ? dbUrl.pathname.slice(1) : undefined,
-      ssl,
-      waitForConnections: true,
-      connectionLimit: 10,
-      queueLimit: 0,
-      connectTimeout: Number(CONNECTION_TIMEOUT),
-      socketPath: SOCKET_PATH || undefined
-    };
+  if (!DATABASE_URL) {
+    throw new Error('❌ Missing DATABASE_URL in .env file');
   }
 
-  if (DB_HOST && DB_USER && DB_PASSWORD && DB_NAME) {
-    const host = DB_HOST === 'localhost' ? '127.0.0.1' : DB_HOST;
-    return {
-      host,
-      port: Number(DB_PORT),
-      user: DB_USER,
-      password: DB_PASSWORD,
-      database: DB_NAME,
-      waitForConnections: true,
-      connectionLimit: 10,
-      queueLimit: 0,
-      connectTimeout: Number(CONNECTION_TIMEOUT),
-      socketPath: SOCKET_PATH || undefined
-    };
-  }
+  const dbUrl = new URL(DATABASE_URL);
+  const sslMode =
+    dbUrl.searchParams.get('sslmode') || dbUrl.searchParams.get('ssl-mode');
 
-  throw new Error(
-    'Missing DB config. Define either DATABASE_URL or DB_HOST, DB_USER, DB_PASSWORD, DB_NAME in your .env'
-  );
+  // ✅ Aiven and Render both require SSL connections
+  const ssl =
+    sslMode && sslMode.toLowerCase().startsWith('req')
+      ? { rejectUnauthorized: false } // accept Aiven’s cert
+      : undefined;
+
+  return {
+    host: dbUrl.hostname,
+    port: Number(dbUrl.port) || 3306,
+    user: dbUrl.username,
+    password: dbUrl.password,
+    database: dbUrl.pathname ? dbUrl.pathname.slice(1) : undefined,
+    ssl,
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0,
+    connectTimeout: Number(CONNECTION_TIMEOUT)
+  };
 }
 
+/**
+ * Create admin connection config (without database name)
+ */
 function createAdminConnectionConfig() {
   const cfg = getDbConfigFromEnv();
   return {
@@ -76,21 +55,24 @@ function createAdminConnectionConfig() {
     user: cfg.user,
     password: cfg.password,
     ssl: cfg.ssl,
-    connectTimeout: cfg.connectTimeout,
-    socketPath: cfg.socketPath
+    connectTimeout: cfg.connectTimeout
   };
 }
 
 let pool = null;
 
+/**
+ * Ensure the database exists before connecting
+ */
 async function ensureDatabaseExists() {
   const cfg = getDbConfigFromEnv();
   const adminCfg = createAdminConnectionConfig();
   const connection = await mysql.createConnection(adminCfg);
+
   const dbName = cfg.database;
   if (!dbName) {
     await connection.end();
-    throw new Error('Database name is not specified in the configuration');
+    throw new Error('❌ Database name not found in DATABASE_URL');
   }
 
   await connection.query(
@@ -99,9 +81,13 @@ async function ensureDatabaseExists() {
   await connection.end();
 }
 
+/**
+ * Create and cache a connection pool
+ */
 async function getPool() {
   if (pool) return pool;
   await ensureDatabaseExists();
+
   const cfg = getDbConfigFromEnv();
 
   const poolOptions = {
@@ -110,20 +96,21 @@ async function getPool() {
     user: cfg.user,
     password: cfg.password,
     database: cfg.database,
-    waitForConnections: cfg.waitForConnections ?? true,
-    connectionLimit: cfg.connectionLimit ?? 10,
-    queueLimit: cfg.queueLimit ?? 0,
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0,
     timezone: 'Z',
-    connectTimeout: cfg.connectTimeout
+    connectTimeout: cfg.connectTimeout,
+    ssl: cfg.ssl // ✅ Aiven needs SSL
   };
-
-  if (cfg.socketPath) poolOptions.socketPath = cfg.socketPath;
-  if (cfg.ssl) poolOptions.ssl = cfg.ssl;
 
   pool = mysql.createPool(poolOptions);
   return pool;
 }
 
+/**
+ * Calculate charge for an amount (used for bets, withdrawals)
+ */
 async function getChargeForAmount(dbClient, amount) {
   const MIN_AMOUNT_THRESHOLD = 100.0;
   const MIN_FEE_FOR_SMALL = 10.0;
@@ -159,8 +146,9 @@ async function getChargeForAmount(dbClient, amount) {
     }
 
     return parseFloat((am * PERCENT_FALLBACK).toFixed(2));
-  } catch {
-    if (am < MIN_AMOUNT_THRESHOLD) return parseFloat(MIN_FEE_FOR_SMALL.toFixed(2));
+  } catch (err) {
+    console.error('⚠️ Error calculating fee:', err.message);
+    if (am < MIN_AMOUNT_THRESHOLD) return MIN_FEE_FOR_SMALL;
     if (am > MAX_BAND_UPPER) {
       const pct = parseFloat((am * PERCENT_FALLBACK).toFixed(2));
       const capped = Math.min(pct, TOP_BAND_CAP_FEE);
@@ -170,10 +158,13 @@ async function getChargeForAmount(dbClient, amount) {
   }
 }
 
+/**
+ * Create all database tables
+ */
 async function initializeDatabase() {
   const db = await getPool();
 
-  // USERS TABLE (✅ includes bank_name/account fields)
+  // USERS
   await db.query(`
     CREATE TABLE IF NOT EXISTS users (
       id INT PRIMARY KEY AUTO_INCREMENT,
@@ -197,7 +188,7 @@ async function initializeDatabase() {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
   `);
 
-  // AUTH TOKENS (✅ added)
+  // AUTH TOKENS
   await db.query(`
     CREATE TABLE IF NOT EXISTS auth_tokens (
       id BIGINT PRIMARY KEY AUTO_INCREMENT,
@@ -377,12 +368,16 @@ async function initializeDatabase() {
   console.log('✅ Database and tables initialized successfully');
 }
 
+/**
+ * Gracefully close the pool
+ */
 async function closePool() {
   if (pool) {
     try {
       await pool.end();
-    } catch {}
-    finally {
+    } catch {
+      // ignore
+    } finally {
       pool = null;
     }
   }

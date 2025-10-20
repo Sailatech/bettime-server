@@ -1,0 +1,37 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Payment callback</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <script>
+      (function () {
+        try {
+          const params = new URLSearchParams(window.location.search);
+          const reference = params.get('reference') || params.get('ref') || null;
+          if (reference) {
+            const payload = { type: 'payment_reference', reference: reference };
+            try {
+              if (window.opener && !window.opener.closed) {
+                window.opener.postMessage(payload, window.location.origin);
+              } else if (window.parent && window.parent !== window) {
+                window.parent.postMessage(payload, window.location.origin);
+              }
+            } catch (e) {
+              console.error('postMessage failed', e);
+            }
+          }
+        } catch (err) {
+          console.error('callback script error', err);
+        } finally {
+          setTimeout(function () {
+            try { window.close(); } catch (e) {}
+          }, 500);
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <p>Processing payment... this page will close automatically.</p>
+  </body>
+</html>

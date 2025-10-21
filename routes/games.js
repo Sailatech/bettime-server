@@ -4,6 +4,10 @@ const router = express.Router();
 const auth = require('../middleware/auth');
 const gameCtrl = require('../controllers/gameController');
 
+function safeAuthPreview(header) {
+  try { return String(header || '').slice(0, 32); } catch (_) { return null; }
+}
+
 function logEntry(req, action) {
   try {
     console.log(`${new Date().toISOString()} - ROUTE ${action}`, {
@@ -11,83 +15,55 @@ function logEntry(req, action) {
       method: req.method,
       userId: req.user?.id ?? null,
       params: req.params,
-      body: req.body,
-      // show only a short preview of Authorization for correlation, not the full token
-      authPreview: (req.headers?.authorization || '').slice(0, 32)
+      // shallow copy of body for logs (avoid very large payloads)
+      body: req.body && Object.keys(req.body).length ? req.body : null,
+      authPreview: safeAuthPreview(req.headers?.authorization)
     });
   } catch (e) {
     console.error('logEntry failed', e && e.stack ? e.stack : e);
   }
 }
 
-// Create a match or join an existing waiting match with same stake
-router.post('/matches', auth, async (req, res, next) => {
-  logEntry(req, 'POST /api/games/matches');
-  try {
-    await gameCtrl.createMatch(req, res);
-    // ensure handler responded; if handler didn't call res.*, send a safe fallback
-    if (!res.headersSent) {
-      console.warn('Handler createMatch did not send response; sending fallback 204');
-      return res.status(204).end();
+/**
+ * Helper wrapper to call controller functions that accept (req,res)
+ * Ensures: errors are forwarded to next, unhandled rejections are caught,
+ * and if the controller callback did not send a response we return a 500.
+ */
+function wrapHandler(actionName, handler) {
+  return async (req, res, next) => {
+    logEntry(req, actionName);
+    try {
+      await handler(req, res);
+      if (!res.headersSent) {
+        const msg = `Handler ${actionName} finished without sending a response`;
+        console.warn(msg);
+        // Include stack in non-production for faster debugging
+        if (process.env.NODE_ENV === 'production') return res.status(500).json({ error: 'Server error' });
+        return res.status(500).json({ error: 'Server error', detail: msg });
+      }
+    } catch (err) {
+      console.error(`${actionName} error`, err && err.stack ? err.stack : err);
+      next(err);
     }
-  } catch (err) {
-    next(err);
-  }
-});
+  };
+}
+
+// Create a match or join an existing waiting match with same stake
+router.post('/matches', auth, wrapHandler('POST /api/games/matches', gameCtrl.createMatch));
 
 // Explicitly join a specific match
-router.post('/matches/:id/join', auth, async (req, res, next) => {
-  logEntry(req, 'POST /api/games/matches/:id/join');
-  try {
-    await gameCtrl.joinMatch(req, res);
-    if (!res.headersSent) return res.status(204).end();
-  } catch (err) {
-    next(err);
-  }
-});
+router.post('/matches/:id/join', auth, wrapHandler('POST /api/games/matches/:id/join', gameCtrl.joinMatch));
 
 // Play a move on a match
-router.post('/matches/:id/move', auth, async (req, res, next) => {
-  logEntry(req, 'POST /api/games/matches/:id/move');
-  try {
-    await gameCtrl.playMove(req, res);
-    if (!res.headersSent) return res.status(204).end();
-  } catch (err) {
-    next(err);
-  }
-});
+router.post('/matches/:id/move', auth, wrapHandler('POST /api/games/matches/:id/move', gameCtrl.playMove));
 
 // Get match state and moves
-router.get('/matches/:id', auth, async (req, res, next) => {
-  logEntry(req, 'GET /api/games/matches/:id');
-  try {
-    await gameCtrl.getMatch(req, res);
-    if (!res.headersSent) return res.status(204).end();
-  } catch (err) {
-    next(err);
-  }
-});
+router.get('/matches/:id', auth, wrapHandler('GET /api/games/matches/:id', gameCtrl.getMatch));
 
 // Cancel a waiting match (creator only)
-router.post('/matches/:id/cancel', auth, async (req, res, next) => {
-  logEntry(req, 'POST /api/games/matches/:id/cancel');
-  try {
-    await gameCtrl.cancelMatch(req, res);
-    if (!res.headersSent) return res.status(204).end();
-  } catch (err) {
-    next(err);
-  }
-});
+router.post('/matches/:id/cancel', auth, wrapHandler('POST /api/games/matches/:id/cancel', gameCtrl.cancelMatch));
 
 // Request that the server simulate an opponent and join the waiting match
-router.post('/matches/:id/simulate', auth, async (req, res, next) => {
-  logEntry(req, 'POST /api/games/matches/:id/simulate');
-  try {
-    await gameCtrl.simulateOpponent(req, res);
-    if (!res.headersSent) return res.status(204).end();
-  } catch (err) {
-    next(err);
-  }
-});
+router.post('/matches/:id/simulate', auth, wrapHandler('POST /api/games/matches/:id/simulate', gameCtrl.simulateOpponent));
 
 module.exports = router;

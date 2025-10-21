@@ -82,7 +82,7 @@ function runSimulationAsync(matchId, opts = {}) {
   setImmediate(async () => {
     try {
       await simulationService.simulateMatch(matchId, opts);
-      broadcastMessage('reload');
+      try { broadcastMessage('reload'); } catch (_) {}
     } catch (err) {
       console.warn('[simulation] error', err && err.message ? err.message : err);
     }
@@ -106,7 +106,7 @@ async function onMatchTimeout(matchId) {
     const winnerSymbol = match.current_turn === 'X' ? 'O' : 'X';
     await matchModel.resolveMatchOutcomeTx(matchId, match.board || EMPTY_BOARD, winnerSymbol);
     clearTimersForMatch(matchId);
-    broadcastMessage('reload');
+    try { broadcastMessage('reload'); } catch (_) {}
   } catch (e) {
     console.error('[onMatchTimeout] error', e && e.stack ? e.stack : e);
   }
@@ -163,7 +163,7 @@ async function onTurnTimeout(matchId) {
 
     await matchModel.resolveMatchOutcomeTx(matchId, match.board || EMPTY_BOARD, winnerSymbol);
     clearTimersForMatch(matchId);
-    broadcastMessage('reload');
+    try { broadcastMessage('reload'); } catch (_) {}
   } catch (e) {
     console.error('[onTurnTimeout] error', e && e.stack ? e.stack : e);
   }
@@ -344,6 +344,7 @@ function checkWin4(boardStr) {
 }
 
 async function createMatch(req, res) {
+  console.log('createMatch request', { ts: new Date().toISOString(), user: req.user?.id ?? null, body: req.body });
   const user = req.user;
   if (!user || !user.id) return res.status(401).json({ error: 'Unauthorized' });
 
@@ -465,7 +466,7 @@ async function createMatch(req, res) {
           if (attached) {
             startTimersForMatch(matchId, 'X');
             setImmediate(() => runSimulationAsync(matchId, { moveDelayMs: SIM_MOVE_DELAY_MS, joinAsBot: true, botIdentity: null }));
-            broadcastMessage('reload');
+            try { broadcastMessage('reload'); } catch (_) {}
           }
         } catch (e) {
           try { await conn2.rollback(); } catch(_){}; try { conn2.release(); } catch(_){} ;
@@ -484,6 +485,7 @@ async function createMatch(req, res) {
 }
 
 async function joinMatch(req, res) {
+  console.log('joinMatch request', { ts: new Date().toISOString(), user: req.user?.id ?? null, params: req.params, body: req.body });
   const user = req.user;
   if (!user || !user.id) return res.status(401).json({ error: 'Unauthorized' });
 
@@ -558,6 +560,7 @@ async function joinMatch(req, res) {
 }
 
 async function playMove(req, res) {
+  console.log('playMove request', { ts: new Date().toISOString(), user: req.user?.id ?? null, params: req.params, body: req.body });
   const user = req.user;
   if (!user || !user.id) return res.status(401).json({ error: 'Unauthorized' });
 
@@ -594,13 +597,13 @@ async function playMove(req, res) {
       if (rec.matchStartTs && now - rec.matchStartTs >= MATCH_MAX_MS) {
         await conn.rollback();
         await onMatchTimeout(matchId);
-        broadcastMessage('reload');
+        try { broadcastMessage('reload'); } catch (_) {}
         return res.status(400).json({ error: 'Match overall time expired; you lost' });
       }
       if (rec.turnStartTs && now - rec.turnStartTs >= TURN_TIMEOUT_MS) {
         await conn.rollback();
         await onTurnTimeout(matchId);
-        broadcastMessage('reload');
+        try { broadcastMessage('reload'); } catch (_) {}
         return res.status(400).json({ error: 'You timed out and lost the match' });
       }
     }
@@ -622,7 +625,7 @@ async function playMove(req, res) {
       await conn.commit();
       await matchModel.resolveMatchOutcomeTx(matchId, newBoard, cb.winner || null);
       clearTimersForMatch(matchId);
-      broadcastMessage('reload');
+      try { broadcastMessage('reload'); } catch (_) {}
       let updatedMatch = await matchModel.getMatchById(pool, matchId, false);
       updatedMatch = await augmentMatchPayload(updatedMatch);
       const moves = await matchModel.getMoves(pool, matchId);
@@ -644,7 +647,7 @@ async function playMove(req, res) {
       if (botTurnSymbol) setImmediate(() => runSimulationAsync(matchId, { moveDelayMs: SIM_MOVE_DELAY_MS, joinAsBot: false }));
     }
 
-    broadcastMessage('reload');
+    try { broadcastMessage('reload'); } catch (_) {}
 
     let updatedMatch = await matchModel.getMatchById(pool, matchId, false);
     updatedMatch = await augmentMatchPayload(updatedMatch);
@@ -660,6 +663,7 @@ async function playMove(req, res) {
 }
 
 async function getMatch(req, res) {
+  console.log('getMatch request', { ts: new Date().toISOString(), params: req.params });
   const matchId = Number(req.params.id);
   if (!matchId) return res.status(400).json({ error: 'Invalid match id' });
 
@@ -687,6 +691,7 @@ async function getMatch(req, res) {
 }
 
 async function cancelMatch(req, res) {
+  console.log('cancelMatch request', { ts: new Date().toISOString(), params: req.params, user: req.user?.id ?? null });
   const user = req.user;
   if (!user || !user.id) return res.status(401).json({ error: 'Unauthorized' });
 
@@ -738,6 +743,7 @@ async function cancelMatch(req, res) {
 }
 
 async function simulateOpponent(req, res) {
+  console.log('simulateOpponent request', { ts: new Date().toISOString(), params: req.params });
   const matchId = Number(req.params.id);
   if (!matchId) return res.status(400).json({ error: 'Invalid match id' });
 
@@ -768,7 +774,7 @@ async function simulateOpponent(req, res) {
 
       startTimersForMatch(matchId, 'X');
       setImmediate(() => runSimulationAsync(matchId, { moveDelayMs: SIM_MOVE_DELAY_MS, joinAsBot: true, botIdentity }));
-      broadcastMessage('reload');  // Notify clients immediately after bot attaches to match
+      try { broadcastMessage('reload'); } catch (_) {}
       let matchWithNames = await matchModel.getMatchById(await getPool(), matchId, false);
       matchWithNames = await augmentMatchPayload(matchWithNames);
       return res.json({ ok: true, match_id: matchId, simulated: true, bot: botIdentity.display_name, match: matchWithNames });

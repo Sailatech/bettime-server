@@ -129,8 +129,202 @@ function chooseMoveHeuristic(boardStr, botSym) {
   return avail[Math.floor(Math.random() * avail.length)];
 }
 
+/* Make the bot effectively unbeatable: minimax with alpha-beta, iterative deepening, ordering, and evaluation */
+
+/* Evaluate board for botSym. Positive = good for botSym, negative = good for opponent. */
+function evaluateBoard(boardArr, botSym) {
+  const opp = botSym === 'X' ? 'O' : 'X';
+
+  // Score map by pattern length for presence in any WIN line
+  const SCORE = {
+    4: 1000000,
+    3: 1000,
+    2: 50,
+    1: 1
+  };
+
+  let score = 0;
+
+  for (const line of LINES) {
+    const vals = line.map(i => boardArr[i]);
+    const countBot = vals.filter(v => v === botSym).length;
+    const countOpp = vals.filter(v => v === opp).length;
+    const countEmpty = vals.filter(v => v === '_').length;
+
+    if (countBot > 0 && countOpp > 0) {
+      if (countBot === WIN_LENGTH - 1 && countEmpty === 1) score += SCORE[3] * 0.9;
+      if (countOpp === WIN_LENGTH - 1 && countEmpty === 1) score -= SCORE[3] * 1.2;
+      continue;
+    }
+
+    if (countBot > 0) {
+      score += (SCORE[countBot] || 0);
+    }
+
+    if (countOpp > 0) {
+      score -= (SCORE[countOpp] || 0) * 1.2;
+    }
+  }
+
+  // slight center control bonus
+  const centerR = (BOARD_ROWS - 1) / 2;
+  const centerC = (BOARD_COLS - 1) / 2;
+  for (let i = 0; i < boardArr.length; i++) {
+    if (boardArr[i] === botSym) {
+      const r = Math.floor(i / BOARD_COLS);
+      const c = i % BOARD_COLS;
+      const dist = Math.hypot(r - centerR, c - centerC);
+      score += Math.max(0, 3 - dist) * 0.5;
+    }
+    if (boardArr[i] !== '_' && boardArr[i] !== botSym) {
+      const r = Math.floor(i / BOARD_COLS);
+      const c = i % BOARD_COLS;
+      const dist = Math.hypot(r - centerR, c - centerC);
+      score -= Math.max(0, 3 - dist) * 0.6;
+    }
+  }
+
+  return score;
+}
+
+/* Terminal check using checkBoard (returns winner symbol, 'DRAW', or null) */
+function terminalResult(boardArr) {
+  const boardStr = boardArr.join('');
+  const res = checkBoard(boardStr);
+  if (res.winner) return res.winner;
+  if (res.isDraw) return 'DRAW';
+  return null;
+}
+
+/* Order moves: immediate wins first, then blocks, then centrality */
+function orderMoves(boardArr, moves, botSym) {
+  const opp = botSym === 'X' ? 'O' : 'X';
+  const scored = moves.map(i => {
+    const copy = boardArr.slice();
+    copy[i] = botSym;
+    const winAfter = terminalResult(copy) === botSym;
+    if (winAfter) return { i, score: 10000000 };
+
+    const copyOpp = boardArr.slice();
+    copyOpp[i] = opp;
+    const oppWinAfter = terminalResult(copyOpp) === opp;
+    if (oppWinAfter) return { i, score: 9000000 };
+
+    const r = Math.floor(i / BOARD_COLS);
+    const c = i % BOARD_COLS;
+    const centerR = (BOARD_ROWS - 1) / 2;
+    const centerC = (BOARD_COLS - 1) / 2;
+    const dist = Math.hypot(r - centerR, c - centerC);
+    return { i, score: -dist };
+  });
+  scored.sort((a, b) => b.score - a.score);
+  return scored.map(s => s.i);
+}
+
+/* Minimax with alpha-beta pruning and time cutoff.
+   Returns { bestScore, bestMove, timedOut } */
+function minimax(boardArr, depth, alpha, beta, maximizingPlayer, botSym, startTime, timeLimitMs) {
+  const now = Date.now();
+  if (now - startTime > timeLimitMs) return { bestScore: evaluateBoard(boardArr, botSym), bestMove: -1, timedOut: true };
+
+  const term = terminalResult(boardArr);
+  if (term === botSym) return { bestScore: 1e9, bestMove: -1, timedOut: false };
+  if (term === (botSym === 'X' ? 'O' : 'X')) return { bestScore: -1e9, bestMove: -1, timedOut: false };
+  if (term === 'DRAW') return { bestScore: 0, bestMove: -1, timedOut: false };
+
+  if (depth === 0) {
+    return { bestScore: evaluateBoard(boardArr, botSym), bestMove: -1, timedOut: false };
+  }
+
+  const curSym = maximizingPlayer ? botSym : (botSym === 'X' ? 'O' : 'X');
+  const moves = availableMoves(boardArr);
+  if (moves.length === 0) return { bestScore: 0, bestMove: -1, timedOut: false };
+
+  const ordered = orderMoves(boardArr, moves, maximizingPlayer ? botSym : (botSym === 'X' ? 'O' : 'X'));
+
+  let bestMove = -1;
+  if (maximizingPlayer) {
+    let value = -Infinity;
+    for (const m of ordered) {
+      boardArr[m] = curSym;
+      const child = minimax(boardArr, depth - 1, alpha, beta, false, botSym, startTime, timeLimitMs);
+      boardArr[m] = '_';
+      if (child.timedOut) return { bestScore: child.bestScore, bestMove: -1, timedOut: true };
+      if (child.bestScore > value) {
+        value = child.bestScore;
+        bestMove = m;
+      }
+      alpha = Math.max(alpha, value);
+      if (alpha >= beta) break;
+    }
+    return { bestScore: value, bestMove, timedOut: false };
+  } else {
+    let value = Infinity;
+    for (const m of ordered) {
+      boardArr[m] = curSym;
+      const child = minimax(boardArr, depth - 1, alpha, beta, true, botSym, startTime, timeLimitMs);
+      boardArr[m] = '_';
+      if (child.timedOut) return { bestScore: child.bestScore, bestMove: -1, timedOut: true };
+      if (child.bestScore < value) {
+        value = child.bestScore;
+        bestMove = m;
+      }
+      beta = Math.min(beta, value);
+      if (alpha >= beta) break;
+    }
+    return { bestScore: value, bestMove, timedOut: false };
+  }
+}
+
+/* New perfect move chooser with iterative deepening bounded by time budget */
 function chooseMovePerfect(boardStr, botSym) {
-  return chooseMoveHeuristic(boardStr, botSym);
+  const board = (boardStr || EMPTY_BOARD).split('');
+  const opp = botSym === 'X' ? 'O' : 'X';
+
+  // immediate win or block
+  const win = findImmediateWin(board, botSym);
+  if (win >= 0) return win;
+  const block = findImmediateWin(board, opp);
+  if (block >= 0) return block;
+
+  const avail = availableMoves(board);
+  if (avail.length === 0) return -1;
+
+  // Time budget: leave margin from TURN_TIMEOUT_MS
+  const timeBudgetMs = Math.max(50, Math.min(1200, TURN_TIMEOUT_MS - 200));
+  const start = Date.now();
+
+  // Baseline best: choose center-most random available
+  const centerR = (BOARD_ROWS - 1) / 2;
+  const centerC = (BOARD_COLS - 1) / 2;
+  let best = avail.slice().sort((a, b) => {
+    const ar = Math.floor(a / BOARD_COLS), ac = a % BOARD_COLS;
+    const br = Math.floor(b / BOARD_COLS), bc = b % BOARD_COLS;
+    const da = Math.hypot(ar - centerR, ac - centerC);
+    const db = Math.hypot(br - centerR, bc - centerC);
+    return da - db;
+  })[0];
+
+  // Iterative deepening
+  let depth = 1;
+  const maxDepthCap = 10;
+  while (true) {
+    const elapsed = Date.now() - start;
+    const remaining = timeBudgetMs - elapsed;
+    if (remaining <= 8) break;
+
+    const useDepth = Math.min(depth, maxDepthCap);
+
+    const boardArr = board.slice();
+    const res = minimax(boardArr, useDepth, -Infinity, Infinity, true, botSym, start, timeBudgetMs);
+    if (res.timedOut) break;
+    if (typeof res.bestMove === 'number' && res.bestMove >= 0) best = res.bestMove;
+    if (res.bestScore >= 1e8) break; // found forced win
+    depth += 1;
+    if (depth > maxDepthCap) break;
+  }
+
+  return best;
 }
 
 /* Utility: polite connection release */

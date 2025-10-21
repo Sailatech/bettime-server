@@ -1,4 +1,4 @@
 PAYSTACK_SECRET present: true
-FRONTEND_CALLBACK_URL: http://localhost:5173/?reference={reference}
+FRONTEND_CALLBACK_URL: https://bettime.onrender.com?reference={reference}
 ✅ Betting DB and tables initialized (including charge_rates seed)
 Server listening on port 4000

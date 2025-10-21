@@ -1,3 +1,4 @@
+// server.js
 require('dotenv').config();
 
 const express = require('express');
@@ -17,13 +18,30 @@ const app = express();
 app.use(helmet());
 
 // CORS configuration
-const allowedOrigin = process.env.FRONTEND_ORIGIN || process.env.CORS_ORIGIN || true;
+const frontendOrigin = process.env.FRONTEND_ORIGIN || process.env.CORS_ORIGIN || '';
+if (!frontendOrigin) {
+  console.warn('WARNING: FRONTEND_ORIGIN not set. Set FRONTEND_ORIGIN to your front-end URL e.g. https://bettime.onrender.com');
+}
+
 const corsOptions = {
-  origin: allowedOrigin,
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  origin: function (origin, callback) {
+    // Allow non-browser tools such as curl or Postman where origin is undefined
+    if (!origin) return callback(null, true);
+    // Allow exact configured frontend origin
+    if (frontendOrigin && origin === frontendOrigin) return callback(null, true);
+    // Allow localhost during development if FRONTEND_ORIGIN not provided
+    if (!frontendOrigin && /^(https?:\/\/localhost:\d+|https?:\/\/127\.0\.0\.1:\d+)$/i.test(origin)) return callback(null, true);
+    return callback(new Error('Not allowed by CORS'));
+  },
+  methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept'],
+  credentials: true,
+  optionsSuccessStatus: 204,
+  maxAge: 600
 };
+
 app.use(cors(corsOptions));
+app.options('*', cors(corsOptions)); // ensure preflight handled
 
 // Serve static files from ./public so the Paystack callback page can be same-origin
 app.use(express.static(path.join(__dirname, 'public')));
@@ -42,7 +60,7 @@ app.use(express.urlencoded({ extended: true }));
 // Health check
 app.get('/healthz', (req, res) => res.json({ status: 'ok' }));
 
-// Explicit route for the Paystack callback page (served from ./public/paystack-callback.html)
+// Explicit route for the Paystack callback page
 app.get('/payments/paystack-callback', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'paystack-callback.html'));
 });
@@ -62,17 +80,17 @@ app.use((err, req, res, next) => {
   const status = err.status || 500;
   const payload = { error: err.message || 'Internal server error' };
   if (process.env.NODE_ENV !== 'production' && err.stack) payload.stack = err.stack;
+  // If error was CORS related, ensure 403 or 400 is returned instead of silent failure
   res.status(status).json(payload);
 });
 
 const PORT = Number(process.env.PORT || 4000);
 
-// startup hint about Paystack and callback configuration
 console.log('PAYSTACK_SECRET present:', !!(process.env.PAYSTACK_SECRET || process.env.PAYSTACK_SECRET_KEY));
 if (process.env.FRONTEND_CALLBACK_URL) {
   console.log('FRONTEND_CALLBACK_URL:', process.env.FRONTEND_CALLBACK_URL);
 } else {
-  console.log('Tip: set FRONTEND_CALLBACK_URL to your /payments/paystack-callback URL for Paystack init (e.g., http://localhost:4000/payments/paystack-callback).');
+  console.log('Tip: set FRONTEND_CALLBACK_URL to your /payments/paystack-callback URL for Paystack init e.g. http://localhost:4000/payments/paystack-callback');
 }
 
 let cleanupControllerHandle = null;
@@ -80,7 +98,6 @@ let serverInstance = null;
 
 async function start() {
   try {
-    // initialize DB and pool
     await initializeDatabase();
     const pool = await getPool();
 
@@ -88,8 +105,7 @@ async function start() {
     const conn = await pool.getConnection();
     conn.release();
 
-    // start periodic DB cleanup via gameController (recommended single starter)
-    // gameController.startPeriodicCleanup returns an object with stop()
+    // start periodic DB cleanup via gameController
     try {
       cleanupControllerHandle = gameController.startPeriodicCleanup({
         intervalMs: Number(process.env.CLEANUP_INTERVAL_MS || 5 * 60 * 1000)
@@ -97,7 +113,6 @@ async function start() {
       console.log('Periodic cleanup started via gameController');
     } catch (e) {
       console.warn('Could not start periodic cleanup via gameController', e && e.stack ? e.stack : e);
-      // As a fallback, attempt to start DB-level cleanup task if exported
       try {
         if (typeof db.startCleanupTask === 'function') {
           db.startCleanupTask();
@@ -115,7 +130,6 @@ async function start() {
     const gracefulShutdown = async () => {
       console.log('Shutting down server...');
       try {
-        // stop cleanup task first
         try {
           if (cleanupControllerHandle && typeof cleanupControllerHandle.stop === 'function') {
             cleanupControllerHandle.stop();
@@ -131,7 +145,6 @@ async function start() {
           console.warn('Error stopping cleanup task', e && e.stack ? e.stack : e);
         }
 
-        // stop accepting new connections and close server
         if (serverInstance && typeof serverInstance.close === 'function') {
           serverInstance.close(async (err) => {
             if (err) console.error('Error closing server', err && err.stack ? err.stack : err);
@@ -155,7 +168,6 @@ async function start() {
           }
         }
 
-        // force exit if graceful shutdown stalls
         setTimeout(() => process.exit(1), 10000);
       } catch (e) {
         console.error('Shutdown error', e && e.stack ? e.stack : e);
@@ -174,7 +186,6 @@ async function start() {
     });
   } catch (err) {
     console.error('Failed to start server', err && err.stack ? err.stack : err);
-    // ensure cleanup task stopped if start failed after it was started
     try {
       if (cleanupControllerHandle && typeof cleanupControllerHandle.stop === 'function') cleanupControllerHandle.stop();
     } catch (_) {}

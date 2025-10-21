@@ -1,27 +1,18 @@
-const crypto = require('crypto');
-const { getPool } = require('../config/db');
+const crypto = require("crypto");
+const { getPool } = require("../config/db");
 
 /**
- * Generate a cryptographically secure opaque token string.
- * Uses base64url encoding to produce URL-safe token (~43 chars from 32 bytes).
+ * Generate a secure random token string (base64url encoded).
  */
 function generateTokenString(bytes = 32) {
-  return crypto.randomBytes(bytes).toString('base64url');
+  return crypto.randomBytes(bytes).toString("base64url");
 }
 
 /**
- * Create and persist a token for a user.
+ * Ensure the auth_tokens table exists and includes all required columns.
+ * This runs once per connection and silently upgrades schema if needed.
  */
-async function createTokenForUser(userId, opts = {}) {
-  if (!userId) throw new Error('userId is required');
-  const pool = await getPool();
-  const token = generateTokenString(32);
-  const createdAt = new Date();
-  const expiresAt = opts.expiresInMinutes ? new Date(Date.now() + Number(opts.expiresInMinutes) * 60000) : null;
-  const name = opts.name ? String(opts.name).slice(0, 100) : null;
-  const deletePrevious = opts.deletePrevious !== undefined ? Boolean(opts.deletePrevious) : true;
-
-  // Ensure auth_tokens table exists (best-effort)
+async function ensureAuthTokensTable(pool) {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS auth_tokens (
       id BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -35,6 +26,40 @@ async function createTokenForUser(userId, opts = {}) {
       INDEX (token)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
   `);
+
+  // Ensure the table has all columns (for older schema versions)
+  const [columns] = await pool.query(`SHOW COLUMNS FROM auth_tokens`);
+  const existing = columns.map((c) => c.Field);
+  const missing = [];
+
+  if (!existing.includes("name"))
+    missing.push("ADD COLUMN name VARCHAR(100) DEFAULT NULL");
+  if (!existing.includes("revoked"))
+    missing.push("ADD COLUMN revoked TINYINT(1) DEFAULT 0");
+
+  if (missing.length > 0) {
+    await pool.query(`ALTER TABLE auth_tokens ${missing.join(", ")}`);
+    console.log("✅ Fixed missing auth_tokens columns:", missing.join(", "));
+  }
+}
+
+/**
+ * Create and persist a token for a user.
+ */
+async function createTokenForUser(userId, opts = {}) {
+  if (!userId) throw new Error("userId is required");
+
+  const pool = await getPool();
+  await ensureAuthTokensTable(pool);
+
+  const token = generateTokenString(32);
+  const createdAt = new Date();
+  const expiresAt = opts.expiresInMinutes
+    ? new Date(Date.now() + Number(opts.expiresInMinutes) * 60000)
+    : null;
+  const name = opts.name ? String(opts.name).slice(0, 100) : null;
+  const deletePrevious =
+    opts.deletePrevious !== undefined ? Boolean(opts.deletePrevious) : true;
 
   const conn = await pool.getConnection();
   try {
@@ -54,30 +79,36 @@ async function createTokenForUser(userId, opts = {}) {
     conn.release();
     return { token, createdAt, expiresAt };
   } catch (err) {
-    try { await conn.rollback(); } catch (_) {}
+    try {
+      await conn.rollback();
+    } catch (_) {}
     conn.release();
     throw err;
   }
 }
 
 /**
- * Revoke a token (mark revoked = 1).
+ * Revoke a specific token.
  */
 async function revokeToken(token) {
   if (!token) return false;
   const pool = await getPool();
-  const [res] = await pool.query(`UPDATE auth_tokens SET revoked = 1 WHERE token = ? AND revoked = 0`, [token]);
-  return res && res.affectedRows && res.affectedRows > 0;
+  await ensureAuthTokensTable(pool);
+
+  const [res] = await pool.query(
+    `UPDATE auth_tokens SET revoked = 1 WHERE token = ? AND revoked = 0`,
+    [token]
+  );
+  return res && res.affectedRows > 0;
 }
 
 /**
- * Find token row and optionally enforce not revoked and not expired.
- * Returns token row joined with user fields when found, otherwise null.
- * The SELECT avoids non-standard columns to prevent unknown-column errors.
+ * Find a token and optionally ensure it’s active (not revoked, not expired, user active).
  */
 async function findToken(token, opts = { requireActive: true }) {
   if (!token) return null;
   const pool = await getPool();
+  await ensureAuthTokensTable(pool);
 
   const [rows] = await pool.query(
     `SELECT
@@ -112,18 +143,20 @@ async function findToken(token, opts = { requireActive: true }) {
     const now = new Date();
     if (row.revoked && Number(row.revoked) === 1) return null;
     if (row.expires_at && new Date(row.expires_at) < now) return null;
-    if (row.status && row.status !== 'active') return null;
+    if (row.status && row.status !== "active") return null;
   }
 
   return row;
 }
 
 /**
- * Revoke all tokens for a user.
+ * Revoke all tokens for a given user (optionally excluding one).
  */
 async function revokeAllTokensForUser(userId, excludeToken = null) {
   if (!userId) return 0;
   const pool = await getPool();
+  await ensureAuthTokensTable(pool);
+
   if (excludeToken) {
     const [res] = await pool.query(
       `UPDATE auth_tokens SET revoked = 1 WHERE user_id = ? AND token != ? AND revoked = 0`,
@@ -131,19 +164,28 @@ async function revokeAllTokensForUser(userId, excludeToken = null) {
     );
     return res.affectedRows || 0;
   } else {
-    const [res] = await pool.query(`UPDATE auth_tokens SET revoked = 1 WHERE user_id = ? AND revoked = 0`, [userId]);
+    const [res] = await pool.query(
+      `UPDATE auth_tokens SET revoked = 1 WHERE user_id = ? AND revoked = 0`,
+      [userId]
+    );
     return res.affectedRows || 0;
   }
 }
 
 /**
- * Prune expired or revoked tokens older than a threshold (days).
+ * Clean up old or revoked tokens older than the given threshold (default 30 days).
  */
 async function pruneTokens(olderThanDays = 30) {
   const pool = await getPool();
-  const cutoff = new Date(Date.now() - Number(olderThanDays) * 24 * 60 * 60 * 1000);
+  await ensureAuthTokensTable(pool);
+
+  const cutoff = new Date(
+    Date.now() - Number(olderThanDays) * 24 * 60 * 60 * 1000
+  );
   const [res] = await pool.query(
-    `DELETE FROM auth_tokens WHERE (revoked = 1 OR (expires_at IS NOT NULL AND expires_at < ?)) AND created_at < ?`,
+    `DELETE FROM auth_tokens
+     WHERE (revoked = 1 OR (expires_at IS NOT NULL AND expires_at < ?))
+     AND created_at < ?`,
     [new Date(), cutoff]
   );
   return res.affectedRows || 0;

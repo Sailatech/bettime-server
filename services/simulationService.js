@@ -245,8 +245,11 @@ async function simulateMatch(matchId, options = {}) {
         const pos = chooseMovePerfect(boardStr, resolvedBotSymbol);
 
         if (pos < 0 || pos >= BOARD_CELLS) {
-          await matchModel.resolveMatchOutcomeTx(matchId, boardStr, null);
+          // commit the transaction first so no locks remain, then resolve outcome outside the transaction
           await conn.commit();
+          try {
+            await matchModel.resolveMatchOutcomeTx(matchId, boardStr, null);
+          } catch (_) {}
           return { ok: true, reason: 'no-valid-move' };
         }
 
@@ -264,11 +267,16 @@ async function simulateMatch(matchId, options = {}) {
         await matchModel.updateMatch(conn, matchId, { board: newBoard, current_turn: nextTurn });
 
         const result = checkBoard(newBoard);
+
+        // commit BEFORE calling resolveMatchOutcomeTx to avoid lock contention
+        await conn.commit();
+
         if (result.winner || result.isDraw) {
-          await matchModel.resolveMatchOutcomeTx(matchId, newBoard, result.winner || null);
+          try {
+            await matchModel.resolveMatchOutcomeTx(matchId, newBoard, result.winner || null);
+          } catch (_) {}
         }
 
-        await conn.commit();
         return { ok: true, reason: 'moved', pos, result: result || null };
       } catch (err) {
         try { if (conn) await conn.rollback(); } catch (_) {}
@@ -305,7 +313,7 @@ async function simulateMatch(matchId, options = {}) {
       const retryTimeout = new Promise(resolve => setTimeout(() => resolve({ ok: false, reason: 'turn-timeout-retry' }), TURN_TIMEOUT_MS));
       const retryResult = await Promise.race([retryPromise, retryTimeout]);
 
-      if (retryResult && retryResult.ok && retryResult.reason === 'moved') {
+      if (retryResult && retryResult.ok && (retryResult.reason === 'moved' || retryResult.reason === 'moved-retry')) {
         return { ok: true, reason: 'moved-retry', pos: retryResult.pos, result: retryResult.result, bot_display_name: botDisplayName, bot_username: botUsername };
       }
 

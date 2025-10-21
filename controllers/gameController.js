@@ -348,7 +348,8 @@ async function createMatch(req, res) {
   if (!user || !user.id) return res.status(401).json({ error: 'Unauthorized' });
 
   const betAmount = Number(req.body.bet_amount);
-  if (isNaN(betAmount) || betAmount <= 0) return res.status(400).json({ error: 'Invalid bet amount' });
+  if (isNaN(betAmount) || betAmount <= 0)
+    return res.status(400).json({ error: 'Invalid bet amount' });
 
   const pool = await getPool();
   const conn = await pool.getConnection();
@@ -356,53 +357,87 @@ async function createMatch(req, res) {
   try {
     await conn.beginTransaction();
 
+    // Look for waiting candidate
     const [candidateRows] = await conn.query(
       `SELECT * FROM matches WHERE status = 'waiting' AND opponent_id IS NULL AND bet_amount = ? ORDER BY id ASC LIMIT 1 FOR UPDATE`,
       [betAmount]
     );
-    const candidate = candidateRows && candidateRows[0] ? candidateRows[0] : null;
+    const candidate = candidateRows?.[0] || null;
 
-    // compute fee amounts using db helper (no DB change)
+    // compute fee and amounts
     const fee = await getChargeForAmount(conn, betAmount);
     const feeAmount = Number((fee || 0).toFixed(2));
-    const debitStake = Number((betAmount).toFixed(2));
-    const debitFee = Number((feeAmount).toFixed(2));
-    const totalDebitCreator = Number((debitStake + debitFee).toFixed(2));
+    const debitStake = Number(betAmount.toFixed(2));
+    const totalDebitCreator = Number((debitStake + feeAmount).toFixed(2));
 
+    // ------------------ JOINING EXISTING MATCH ------------------
     if (candidate && candidate.creator_id !== user.id) {
-      // Joining an existing candidate
-      const feeJoin = await getChargeForAmount(conn, betAmount);
-      const feeAmountJoin = Number((feeJoin || 0).toFixed(2));
-      const debitStakeJoin = Number((betAmount).toFixed(2));
-      const debitFeeJoin = Number((feeAmountJoin).toFixed(2));
-      const totalDebit = Number((debitStakeJoin + debitFeeJoin).toFixed(2));
-
-      const [userRows] = await conn.query('SELECT id, balance FROM users WHERE id = ? FOR UPDATE', [user.id]);
-      if (!userRows || !userRows[0]) { await conn.rollback(); return res.status(404).json({ error: 'User not found' }); }
-      if (Number(userRows[0].balance || 0) < totalDebit) { await conn.rollback(); return res.status(400).json({ error: 'Insufficient balance to join' }); }
-
-      // Deduct stake
-      await conn.query('UPDATE users SET balance = balance - ? WHERE id = ?', [debitStakeJoin, user.id]);
-
-      // Deduct fee and credit admin once via model helper
-      if (debitFeeJoin > 0) {
-        const ref = `match_${candidate.id}_join_fee_${user.id}`;
-        await matchModel.applyFeeOnce(conn, ref, user.id, debitFeeJoin);
+      const [userRows] = await conn.query(
+        'SELECT id, balance FROM users WHERE id = ? FOR UPDATE',
+        [user.id]
+      );
+      const userRow = userRows?.[0];
+      if (!userRow) {
+        await conn.rollback();
+        return res.status(404).json({ error: 'User not found' });
       }
 
-      // Insert stake tx for joiner
+      const feeJoin = await getChargeForAmount(conn, betAmount);
+      const feeAmountJoin = Number((feeJoin || 0).toFixed(2));
+      const totalDebit = Number((betAmount + feeAmountJoin).toFixed(2));
+
+      if (Number(userRow.balance || 0) < totalDebit) {
+        await conn.rollback();
+        return res
+          .status(400)
+          .json({ error: 'Insufficient balance to join' });
+      }
+
+      // Deduct stake and fee
+      await conn.query('UPDATE users SET balance = balance - ? WHERE id = ?', [
+        betAmount,
+        user.id,
+      ]);
+
+      if (feeAmountJoin > 0) {
+        const ref = `match_${candidate.id}_join_fee_${user.id}`;
+        await matchModel.applyFeeOnce(conn, ref, user.id, feeAmountJoin);
+      }
+
       await matchModel.insertBalanceTransaction(conn, {
-        user_id: user.id, amount: debitStakeJoin, type: 'debit', source: 'match_stake',
-        reference_id: `match_${candidate.id}_stake_${user.id}`, status: 'completed',
-        meta: { match_id: candidate.id, fee: debitFeeJoin }
+        user_id: user.id,
+        amount: betAmount,
+        type: 'debit',
+        source: 'match_stake',
+        reference_id: `match_${candidate.id}_stake_${user.id}`,
+        status: 'completed',
+        meta: { match_id: candidate.id, fee: feeAmountJoin },
       });
 
-      // Update match to playing and set current turn
-      await matchModel.updateMatch(conn, candidate.id, { opponent_id: user.id, status: 'playing', current_turn: 'X' });
+      // Update match to playing
+      await matchModel.updateMatch(conn, candidate.id, {
+        opponent_id: user.id,
+        status: 'playing',
+        current_turn: 'X',
+      });
 
-      // Insert bets for both parties
-      await matchModel.insertBet(conn, candidate.id, candidate.creator_id, betAmount, Number((betAmount - feeAmountJoin).toFixed(2)), feeAmountJoin);
-      await matchModel.insertBet(conn, candidate.id, user.id, betAmount, Number((betAmount - feeAmountJoin).toFixed(2)), feeAmountJoin);
+      // Insert bets for both
+      await matchModel.insertBet(
+        conn,
+        candidate.id,
+        candidate.creator_id,
+        betAmount,
+        Number((betAmount - feeAmountJoin).toFixed(2)),
+        feeAmountJoin
+      );
+      await matchModel.insertBet(
+        conn,
+        candidate.id,
+        user.id,
+        betAmount,
+        Number((betAmount - feeAmountJoin).toFixed(2)),
+        feeAmountJoin
+      );
 
       await conn.commit();
 
@@ -411,77 +446,130 @@ async function createMatch(req, res) {
       let matchWithNames = await matchModel.getMatchById(pool, candidate.id, false);
       matchWithNames = await augmentMatchPayload(matchWithNames);
 
-      setImmediate(() => runSimulationAsync(candidate.id, { moveDelayMs: SIM_MOVE_DELAY_MS, joinAsBot: false }));
-      return res.json({ ok: true, matched: true, match: matchWithNames, status: 'playing', fee: feeAmountJoin, total_debit: totalDebit });
+      // ✅ Attach fee data directly to match for frontend compatibility
+      matchWithNames.fee = feeAmountJoin;
+      matchWithNames.total_debit = totalDebit;
+
+      setImmediate(() =>
+        runSimulationAsync(candidate.id, { moveDelayMs: SIM_MOVE_DELAY_MS })
+      );
+
+      return res.json({
+        ok: true,
+        matched: true,
+        status: 'playing',
+        match: matchWithNames,
+      });
     }
 
-    // Creating a new match (no candidate)
-    const [creatorRows] = await conn.query('SELECT id, balance FROM users WHERE id = ? FOR UPDATE', [user.id]);
-    if (!creatorRows || !creatorRows[0]) { await conn.rollback(); return res.status(404).json({ error: 'User not found' }); }
-    if (Number(creatorRows[0].balance || 0) < totalDebitCreator) { await conn.rollback(); return res.status(400).json({ error: 'Insufficient balance' }); }
+    // ------------------ CREATING NEW MATCH ------------------
+    const [creatorRows] = await conn.query(
+      'SELECT id, balance FROM users WHERE id = ? FOR UPDATE',
+      [user.id]
+    );
+    const creator = creatorRows?.[0];
+    if (!creator) {
+      await conn.rollback();
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    if (Number(creator.balance || 0) < totalDebitCreator) {
+      await conn.rollback();
+      return res.status(400).json({ error: 'Insufficient balance' });
+    }
 
     // Deduct stake
-    await conn.query('UPDATE users SET balance = balance - ? WHERE id = ?', [debitStake, user.id]);
+    await conn.query('UPDATE users SET balance = balance - ? WHERE id = ?', [
+      betAmount,
+      user.id,
+    ]);
 
-    // Create match row so we have deterministic matchId for fee reference
+    // Create match row
     const matchId = await matchModel.createMatchRow(conn, user.id, betAmount);
 
-    // Apply fee idempotently using model helper
-    if (debitFee > 0) {
+    if (feeAmount > 0) {
       const ref = `match_${matchId}_create_fee_${user.id}`;
-      await matchModel.applyFeeOnce(conn, ref, user.id, debitFee);
+      await matchModel.applyFeeOnce(conn, ref, user.id, feeAmount);
     }
 
-    // Ensure board persisted
     await matchModel.updateMatch(conn, matchId, { board: EMPTY_BOARD });
 
-    // Insert stake tx
     await matchModel.insertBalanceTransaction(conn, {
-      user_id: user.id, amount: debitStake, type: 'debit', source: 'match_stake',
-      reference_id: `match_${matchId}_stake_${user.id}`, status: 'completed',
-      meta: { match_id: matchId, fee: debitFee }
+      user_id: user.id,
+      amount: betAmount,
+      type: 'debit',
+      source: 'match_stake',
+      reference_id: `match_${matchId}_stake_${user.id}`,
+      status: 'completed',
+      meta: { match_id: matchId, fee: feeAmount },
     });
 
-    // Insert bet for creator
-    await matchModel.insertBet(conn, matchId, user.id, betAmount, Number((betAmount - feeAmount).toFixed(2)), feeAmount);
+    await matchModel.insertBet(
+      conn,
+      matchId,
+      user.id,
+      betAmount,
+      Number((betAmount - feeAmount).toFixed(2)),
+      feeAmount
+    );
 
     await conn.commit();
 
     let matchWithNames = await matchModel.getMatchById(pool, matchId, false);
     matchWithNames = await augmentMatchPayload(matchWithNames);
 
-    // Schedule auto-attach bot if still waiting
+    // ✅ Attach fee data for frontend compatibility
+    matchWithNames.fee = feeAmount;
+    matchWithNames.total_debit = totalDebitCreator;
+
+    // Auto attach bot after timeout if still waiting
     setTimeout(async () => {
       try {
         const pool2 = await getPool();
         const conn2 = await pool2.getConnection();
-        try {
-          await conn2.beginTransaction();
-          const m = await matchModel.getMatchById(conn2, matchId, true);
-          if (!m || m.status !== 'waiting' || m.opponent_id) { await conn2.rollback(); try { conn2.release(); } catch(_){}; return; }
-          await conn2.commit(); try { conn2.release(); } catch(_){} ;
+        await conn2.beginTransaction();
+        const m = await matchModel.getMatchById(conn2, matchId, true);
+        if (!m || m.status !== 'waiting' || m.opponent_id) {
+          await conn2.rollback();
+          conn2.release();
+          return;
+        }
+        await conn2.commit();
+        conn2.release();
 
-          const attached = await attachBotToMatchIfAvailable(matchId, 'opponent');
-          if (attached) {
-            startTimersForMatch(matchId, 'X');
-            setImmediate(() => runSimulationAsync(matchId, { moveDelayMs: SIM_MOVE_DELAY_MS, joinAsBot: true, botIdentity: null }));
-            broadcastMessage('reload');
-          }
-        } catch (e) {
-          try { await conn2.rollback(); } catch(_){}; try { conn2.release(); } catch(_){} ;
+        const attached = await attachBotToMatchIfAvailable(matchId, 'opponent');
+        if (attached) {
+          startTimersForMatch(matchId, 'X');
+          setImmediate(() =>
+            runSimulationAsync(matchId, {
+              moveDelayMs: SIM_MOVE_DELAY_MS,
+              joinAsBot: true,
+            })
+          );
+          broadcastMessage('reload');
         }
       } catch (_) {}
     }, AUTO_SIMULATE_WAIT_MS);
 
-    return res.json({ ok: true, matched: false, match: matchWithNames, status: 'waiting', fee: feeAmount, total_debit: totalDebitCreator });
+    return res.json({
+      ok: true,
+      matched: false,
+      status: 'waiting',
+      match: matchWithNames,
+    });
   } catch (err) {
-    try { await conn.rollback(); } catch (_) {}
-    console.error('[gameController.createMatch] error', err && err.stack ? err.stack : err);
+    try {
+      await conn.rollback();
+    } catch (_) {}
+    console.error('[gameController.createMatch] error', err);
     return res.status(500).json({ error: 'Could not create match' });
   } finally {
-    try { conn.release(); } catch (_) {}
+    try {
+      conn.release();
+    } catch (_) {}
   }
 }
+
 
 async function joinMatch(req, res) {
   const user = req.user;

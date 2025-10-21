@@ -1,7 +1,7 @@
 // controllers/authController.js
 const bcrypt = require('bcryptjs');
 const { getPool } = require('../config/db');
-const { createTokenForUser, revokeToken } = require('../helpers/tokenHelper');
+const { createTokenForUser, revokeToken, findToken } = require('../helpers/tokenHelper');
 
 /**
  * Convert internal user row to public-safe payload
@@ -65,6 +65,11 @@ async function register(req, res) {
       return res.status(500).json({ error: 'Failed to fetch created user' });
 
     const tk = await createTokenForUser(userRow.id, { expiresInMinutes: 60 * 24 * 7 }); // 7 days
+    if (!tk || !tk.token) {
+      console.error('createTokenForUser failed for user', userRow.id);
+      return res.status(500).json({ error: 'Failed to create token' });
+    }
+
     const safeUser = safeUserRowToPublic(userRow);
 
     return res.json({ user: safeUser, token: tk.token, expiresAt: tk.expiresAt || null });
@@ -97,6 +102,10 @@ async function login(req, res) {
       return res.status(400).json({ error: 'Invalid credentials' });
 
     const tk = await createTokenForUser(user.id, { expiresInMinutes: 60 * 24 * 7 }); // 7 days
+    if (!tk || !tk.token) {
+      console.error('createTokenForUser failed for user', user.id);
+      return res.status(500).json({ error: 'Failed to create token' });
+    }
 
     try {
       await db.query(`UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?`, [user.id]);
@@ -170,6 +179,27 @@ async function me(req, res) {
 
     if (!token) return res.status(401).json({ error: 'No token' });
 
+    // Prefer the helper which already validates revoked/expired/user status
+    try {
+      const tokenRow = await findToken(token, { requireActive: true });
+      if (tokenRow) {
+        const userRow = {
+          ...tokenRow,
+          balance: Number(tokenRow.balance ?? 0),
+          last_login: tokenRow.last_login || tokenRow.token_created_at || null,
+        };
+        const publicUser = safeUserRowToPublic(userRow) || {};
+        publicUser.bank_name = userRow.bank_name || null;
+        publicUser.account_number = userRow.account_number || null;
+        publicUser.account_name = userRow.account_name || null;
+        return res.json({ user: publicUser });
+      }
+    } catch (e) {
+      console.error('me: findToken failed', { err: e && e.message, tokenPreview: String(token).slice(0, 8) });
+      // fall through to direct DB query as a last resort
+    }
+
+    // Last-resort direct DB lookup (defensive)
     const db = await getPool();
     const [rows] = await db.query(
       `SELECT u.* FROM auth_tokens t 
@@ -179,10 +209,10 @@ async function me(req, res) {
       [token]
     );
 
-    if (!rows || !rows.length)
-      return res.status(401).json({ error: 'Invalid token' });
+    if (!rows || !rows.length) return res.status(401).json({ error: 'Invalid token' });
 
     const userRow = rows[0];
+    userRow.balance = Number(userRow.balance ?? 0);
     const publicUser = safeUserRowToPublic(userRow) || {};
     publicUser.bank_name = userRow.bank_name || null;
     publicUser.account_number = userRow.account_number || null;

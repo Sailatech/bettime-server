@@ -1,11 +1,3 @@
-// src/controllers/withdrawalController.js
-// Enhanced controller that will ensure users table has bank_name, account_number, account_name columns.
-// If columns are missing the controller will add them (ALTER TABLE) before attempting updates.
-// This makes updateBankInfo safe to call even when the users table wasn't migrated yet.
-//
-// Note: performing schema changes from application code is convenient for quick setups but
-// in production you should prefer explicit DB migrations. This code performs minimal ALTERs
-// and logs actions. Requires DB user to have ALTER TABLE privileges.
 
 const { getPool } = require('../config/db');
 const matchModel = require('../models/matchModel');

@@ -1,3 +1,4 @@
+// helpers/tokenHelper.js
 const crypto = require("crypto");
 const { getPool } = require("../config/db");
 
@@ -45,6 +46,7 @@ async function ensureAuthTokensTable(pool) {
 
 /**
  * Create and persist a token for a user.
+ * Returns { token, createdAt, expiresAt } on success or throws on failure.
  */
 async function createTokenForUser(userId, opts = {}) {
   if (!userId) throw new Error("userId is required");
@@ -69,11 +71,16 @@ async function createTokenForUser(userId, opts = {}) {
       await conn.query(`DELETE FROM auth_tokens WHERE user_id = ?`, [userId]);
     }
 
-    await conn.query(
+    const [result] = await conn.query(
       `INSERT INTO auth_tokens (user_id, token, name, created_at, expires_at, revoked)
        VALUES (?, ?, ?, ?, ?, 0)`,
       [userId, token, name, createdAt, expiresAt]
     );
+
+    if (!result || !result.insertId) {
+      await conn.rollback();
+      throw new Error("Failed to insert auth token");
+    }
 
     await conn.commit();
     conn.release();
@@ -104,6 +111,7 @@ async function revokeToken(token) {
 
 /**
  * Find a token and optionally ensure it’s active (not revoked, not expired, user active).
+ * Returns joined token+user row or null.
  */
 async function findToken(token, opts = { requireActive: true }) {
   if (!token) return null;
@@ -124,6 +132,7 @@ async function findToken(token, opts = { requireActive: true }) {
        u.email,
        u.display_name,
        u.balance,
+       u.last_login,
        u.status,
        u.role,
        u.bank_name,
@@ -146,7 +155,14 @@ async function findToken(token, opts = { requireActive: true }) {
     if (row.status && row.status !== "active") return null;
   }
 
-  return row;
+  // Normalize numeric/date fields to safe JS types
+  return {
+    ...row,
+    balance: Number(row.balance ?? 0),
+    token_created_at: row.token_created_at ? new Date(row.token_created_at) : null,
+    expires_at: row.expires_at ? new Date(row.expires_at) : null,
+    last_login: row.last_login ? new Date(row.last_login) : null,
+  };
 }
 
 /**

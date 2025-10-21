@@ -57,6 +57,13 @@ app.use(
 );
 app.use(express.urlencoded({ extended: true }));
 
+// Basic startup log
+console.log('SERVER STARTING', {
+  env: process.env.NODE_ENV || null,
+  portEnv: process.env.PORT || null,
+  frontendOrigin: frontendOrigin || null
+});
+
 // Health check
 app.get('/healthz', (req, res) => res.json({ status: 'ok' }));
 
@@ -74,18 +81,24 @@ app.get('/api/me', authMiddleware, async (req, res) => {
   res.json({ user: { id: req.user.id, username: req.user.username, email: req.user.email, balance: req.user.balance } });
 });
 
-// Global error handler
+// Global error handler (ensures a body is always returned)
 app.use((err, req, res, next) => {
-  console.error('Unhandled error', err && err.stack ? err.stack : err);
-  const status = err.status || 500;
-  const payload = { error: err.message || 'Internal server error' };
-  if (process.env.NODE_ENV !== 'production' && err.stack) payload.stack = err.stack;
-  // If error was CORS related, ensure 403 or 400 is returned instead of silent failure
-  res.status(status).json(payload);
+  try {
+    console.error('Unhandled error', err && err.stack ? err.stack : err);
+    const status = err.status || 500;
+    const payload = { error: err.message || 'Internal server error' };
+    if (process.env.NODE_ENV !== 'production' && err.stack) payload.stack = err.stack;
+    res.status(status).json(payload);
+  } catch (e) {
+    // Last-resort fallback if error handler itself fails
+    console.error('Error in global error handler', e && e.stack ? e.stack : e);
+    try { res.status(500).json({ error: 'Critical server error' }); } catch (_) {}
+  }
 });
 
 const PORT = Number(process.env.PORT || 4000);
 
+// startup hints
 console.log('PAYSTACK_SECRET present:', !!(process.env.PAYSTACK_SECRET || process.env.PAYSTACK_SECRET_KEY));
 if (process.env.FRONTEND_CALLBACK_URL) {
   console.log('FRONTEND_CALLBACK_URL:', process.env.FRONTEND_CALLBACK_URL);
@@ -107,10 +120,14 @@ async function start() {
 
     // start periodic DB cleanup via gameController
     try {
-      cleanupControllerHandle = gameController.startPeriodicCleanup({
-        intervalMs: Number(process.env.CLEANUP_INTERVAL_MS || 5 * 60 * 1000)
-      });
-      console.log('Periodic cleanup started via gameController');
+      if (gameController && typeof gameController.startPeriodicCleanup === 'function') {
+        cleanupControllerHandle = gameController.startPeriodicCleanup({
+          intervalMs: Number(process.env.CLEANUP_INTERVAL_MS || 5 * 60 * 1000)
+        });
+        console.log('Periodic cleanup started via gameController');
+      } else {
+        console.log('No gameController.startPeriodicCleanup available');
+      }
     } catch (e) {
       console.warn('Could not start periodic cleanup via gameController', e && e.stack ? e.stack : e);
       try {
@@ -123,7 +140,8 @@ async function start() {
       }
     }
 
-    serverInstance = app.listen(PORT, () => {
+    // ensure we bind to 0.0.0.0 for Render
+    serverInstance = app.listen(PORT, '0.0.0.0', () => {
       console.log(`Server listening on port ${PORT}`);
     });
 
@@ -134,9 +152,6 @@ async function start() {
           if (cleanupControllerHandle && typeof cleanupControllerHandle.stop === 'function') {
             cleanupControllerHandle.stop();
             console.log('Stopped cleanup via gameController handle');
-          } else if (gameController && gameController._cleanupHandle && gameController._cleanupHandle.handle && typeof gameController._cleanupHandle.handle.stop === 'function') {
-            gameController._cleanupHandle.handle.stop();
-            console.log('Stopped cleanup via gameController internal handle');
           } else if (typeof db.stopCleanupTask === 'function') {
             db.stopCleanupTask();
             console.log('Stopped cleanup via db.stopCleanupTask fallback');

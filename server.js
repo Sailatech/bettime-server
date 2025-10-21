@@ -1,4 +1,3 @@
-// server.js
 require('dotenv').config();
 
 const express = require('express');
@@ -17,20 +16,29 @@ const app = express();
 // Security headers
 app.use(helmet());
 
-// CORS configuration
-const frontendOrigin = process.env.FRONTEND_ORIGIN || process.env.CORS_ORIGIN || '';
-if (!frontendOrigin) {
+// CORS configuration - supports single origin or comma-separated list in FRONTEND_ORIGIN / CORS_ORIGIN
+const rawOrigins = (process.env.FRONTEND_ORIGIN || process.env.CORS_ORIGIN || '').trim();
+const allowedOrigins = rawOrigins ? rawOrigins.split(',').map(s => s.trim()).filter(Boolean) : [];
+
+if (allowedOrigins.length === 0) {
   console.warn('WARNING: FRONTEND_ORIGIN not set. Set FRONTEND_ORIGIN to your front-end URL e.g. https://bettime.onrender.com');
+} else {
+  console.log('CORS allowed origins:', allowedOrigins);
 }
 
 const corsOptions = {
   origin: function (origin, callback) {
-    // Allow non-browser tools such as curl or Postman where origin is undefined
+    // allow non-browser tools such as curl or Postman where origin is undefined
     if (!origin) return callback(null, true);
-    // Allow exact configured frontend origin
-    if (frontendOrigin && origin === frontendOrigin) return callback(null, true);
-    // Allow localhost during development if FRONTEND_ORIGIN not provided
-    if (!frontendOrigin && /^(https?:\/\/localhost:\d+|https?:\/\/127\.0\.0\.1:\d+)$/i.test(origin)) return callback(null, true);
+
+    // Exact match against configured origins
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+
+    // For development when FRONTEND_ORIGIN not configured allow localhost variants
+    if (!allowedOrigins.length && /^(https?:\/\/localhost:\d+|https?:\/\/127\.0\.0\.1:\d+)$/i.test(origin)) return callback(null, true);
+
+    // fallback: deny
+    console.warn('CORS denied origin:', origin);
     return callback(new Error('Not allowed by CORS'));
   },
   methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS'],
@@ -39,6 +47,14 @@ const corsOptions = {
   optionsSuccessStatus: 204,
   maxAge: 600
 };
+
+// Log preflight requests for debugging
+app.use((req, res, next) => {
+  if (req.method === 'OPTIONS') {
+    console.log('Preflight request', { origin: req.get('Origin'), path: req.path });
+  }
+  next();
+});
 
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions)); // ensure preflight handled
@@ -61,7 +77,7 @@ app.use(express.urlencoded({ extended: true }));
 console.log('SERVER STARTING', {
   env: process.env.NODE_ENV || null,
   portEnv: process.env.PORT || null,
-  frontendOrigin: frontendOrigin || null
+  frontendOrigin: allowedOrigins.length ? allowedOrigins : null
 });
 
 // Health check

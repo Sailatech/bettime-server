@@ -13,7 +13,7 @@ const authMiddleware = require('./middleware/auth');
 const gameController = require('./controllers/gameController');
 const { ensureAdminFromEnv } = require('./boot/admin-seed');
 
-// API-key pieces (ensure these files exist as per previous instructions)
+// API-key pieces
 const apiKeyAuth = require('./middleware/apiKeyAuth');
 const adminApiKeysRouter = require('./routes/adminApiKeys');
 
@@ -44,7 +44,6 @@ if (!allowedOrigins.includes(ADMIN_PANEL_ORIGIN)) {
   allowedOrigins.push(ADMIN_PANEL_ORIGIN);
 }
 
-// If running in production and FRONTEND_ORIGIN not set, still include admin origin
 if (allowedOrigins.length === 0) {
   console.warn('WARNING: FRONTEND_ORIGIN not set. Set FRONTEND_ORIGIN to your front-end URL e.g. https://your-frontend.example.com');
 } else {
@@ -53,16 +52,9 @@ if (allowedOrigins.length === 0) {
 
 const corsOptions = {
   origin: function (origin, callback) {
-    // allow non-browser tools such as curl or Postman where origin is undefined
     if (!origin) return callback(null, true);
-
-    // Exact match against configured origins
     if (allowedOrigins.includes(origin)) return callback(null, true);
-
-    // For development when FRONTEND_ORIGIN not configured allow localhost variants
     if (!allowedOrigins.length && /^(https?:\/\/localhost:\d+|https?:\/\/127\.0\.0\.1:\d+)$/i.test(origin)) return callback(null, true);
-
-    // fallback: deny
     console.warn('CORS denied origin:', origin);
     return callback(new Error('Not allowed by CORS'));
   },
@@ -106,8 +98,61 @@ app.get('/payments/paystack-callback', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'paystack-callback.html'));
 });
 
-// Mount public API routes under /api
-app.use('/api', routes);
+/**
+ * Combined guard for /api:
+ * - Allow if request supplies a valid API key (apiKeyAuth)
+ * - OR allow if the request carries a valid admin/user session token (authMiddleware)
+ * - Otherwise reject with 401
+ *
+ * This prevents clients from calling /api without either an API key or a logged-in session.
+ */
+async function apiKeyOrSessionGuard(req, res, next) {
+  try {
+    // quick path: if apiKeyAuth passes, it will call next() — emulate by calling it and catching errors
+    let called = false;
+    const maybeNextFromApiKey = () =>
+      new Promise((resolve, reject) => {
+        apiKeyAuth(req, res, (err) => {
+          if (err) return reject(err);
+          // apiKeyAuth sets req.apiKey when successful
+          if (req.apiKey) {
+            called = true;
+            return resolve(true);
+          }
+          resolve(false);
+        });
+      });
+
+    const apiKeyResult = await maybeNextFromApiKey().catch(() => false);
+    if (apiKeyResult === true) return next();
+
+    // second path: session-based auth. Run authMiddleware but do not early-return the response.
+    let sessionPassed = false;
+    const maybeSession = () =>
+      new Promise((resolve, reject) => {
+        authMiddleware(req, res, (err) => {
+          if (err) return reject(err);
+          if (req.user) {
+            sessionPassed = true;
+            return resolve(true);
+          }
+          resolve(false);
+        });
+      });
+
+    const sessionResult = await maybeSession().catch(() => false);
+    if (sessionResult === true) return next();
+
+    // neither API key nor session present/valid
+    return res.status(401).json({ error: 'API key or session required' });
+  } catch (err) {
+    console.error('[apiKeyOrSessionGuard] error', err && err.stack ? err.stack : err);
+    return res.status(500).json({ error: 'Auth guard error' });
+  }
+}
+
+// Mount /api with guard that requires API key or session
+app.use('/api', apiKeyOrSessionGuard, routes);
 
 // Mount admin auth route (public login, protected logout)
 app.use('/admin/auth', adminAuthRouter);
@@ -125,9 +170,11 @@ app.get('/api/me', authMiddleware, async (req, res) => {
   res.json({ user: { id: req.user.id, username: req.user.username, email: req.user.email, balance: req.user.balance } });
 });
 
-// Example route accessible to external clients via API key
-app.get('/api/external-data', apiKeyAuth, async (req, res) => {
-  res.json({ ok: true, apiKey: req.apiKey || null, data: { message: 'external data' } });
+// Example route accessible to external clients via API key (also protected by apiKeyOrSessionGuard above)
+// If you want endpoint-only rules, add them inside routes instead of here
+app.get('/api/external-data', async (req, res) => {
+  // req.apiKey present when accessed via API key; req.user present when session auth used
+  res.json({ ok: true, apiKey: req.apiKey || null, user: req.user ? { id: req.user.id, username: req.user.username } : null, data: { message: 'external data' } });
 });
 
 // Global error handler (ensures a body is always returned)
@@ -137,7 +184,6 @@ app.use((err, req, res, next) => {
     const status = err && (err.status || 500) ? (err.status || 500) : 500;
     const payload = { error: (err && err.message) ? err.message : 'Internal server error' };
     if (process.env.NODE_ENV !== 'production' && err && err.stack) payload.stack = err.stack;
-    // Ensure CORS headers are present on errors for browser to see the JSON
     try {
       const origin = req.headers.origin;
       if (origin && allowedOrigins.includes(origin)) {

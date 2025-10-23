@@ -13,9 +13,9 @@ const authMiddleware = require('./middleware/auth');
 const gameController = require('./controllers/gameController');
 const { ensureAdminFromEnv } = require('./boot/admin-seed');
 
-// New: API key middleware and admin API-key route
-const apiKeyAuth = require('./middleware/apiKeyAuth'); // validate client requests using x-api-key or Authorization: ApiKey <key>
-const adminApiKeysRouter = require('./routes/adminApiKeys'); // admin endpoint to create/list/revoke/rotate keys
+// API-key pieces (ensure these files exist as per previous instructions)
+const apiKeyAuth = require('./middleware/apiKeyAuth');
+const adminApiKeysRouter = require('./routes/adminApiKeys');
 
 const adminAuthRouter = require('./routes/adminAuth');
 const adminWithdrawalsRouter = require('./routes/adminWithdrawals');
@@ -25,6 +25,14 @@ const app = express();
 
 // Security headers
 app.use(helmet());
+
+// Simple request logger and origin debugger for CORS troubleshooting
+app.use((req, res, next) => {
+  try {
+    console.debug(`[REQ] ${req.method} ${req.path} Origin=${req.headers.origin || 'none'}`);
+  } catch (e) {}
+  next();
+});
 
 // CORS configuration - supports single origin or comma-separated list in FRONTEND_ORIGIN / CORS_ORIGIN
 const rawOrigins = (process.env.FRONTEND_ORIGIN || process.env.CORS_ORIGIN || '').trim();
@@ -36,6 +44,7 @@ if (!allowedOrigins.includes(ADMIN_PANEL_ORIGIN)) {
   allowedOrigins.push(ADMIN_PANEL_ORIGIN);
 }
 
+// If running in production and FRONTEND_ORIGIN not set, still include admin origin
 if (allowedOrigins.length === 0) {
   console.warn('WARNING: FRONTEND_ORIGIN not set. Set FRONTEND_ORIGIN to your front-end URL e.g. https://your-frontend.example.com');
 } else {
@@ -59,6 +68,7 @@ const corsOptions = {
   },
   methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'x-api-key'],
+  exposedHeaders: ['Content-Length'],
   credentials: true,
   optionsSuccessStatus: 204,
   maxAge: 600
@@ -116,9 +126,7 @@ app.get('/api/me', authMiddleware, async (req, res) => {
 });
 
 // Example route accessible to external clients via API key
-// Place real public endpoints under /api/public or similar and protect with apiKeyAuth
 app.get('/api/external-data', apiKeyAuth, async (req, res) => {
-  // req.apiKey is set by middleware and contains id, name, meta, lastUsedAt
   res.json({ ok: true, apiKey: req.apiKey || null, data: { message: 'external data' } });
 });
 
@@ -126,9 +134,17 @@ app.get('/api/external-data', apiKeyAuth, async (req, res) => {
 app.use((err, req, res, next) => {
   try {
     console.error('Unhandled error', err && err.stack ? err.stack : err);
-    const status = err.status || 500;
-    const payload = { error: err.message || 'Internal server error' };
-    if (process.env.NODE_ENV !== 'production' && err.stack) payload.stack = err.stack;
+    const status = err && (err.status || 500) ? (err.status || 500) : 500;
+    const payload = { error: (err && err.message) ? err.message : 'Internal server error' };
+    if (process.env.NODE_ENV !== 'production' && err && err.stack) payload.stack = err.stack;
+    // Ensure CORS headers are present on errors for browser to see the JSON
+    try {
+      const origin = req.headers.origin;
+      if (origin && allowedOrigins.includes(origin)) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+        res.setHeader('Access-Control-Allow-Credentials', 'true');
+      }
+    } catch (e) {}
     res.status(status).json(payload);
   } catch (e) {
     console.error('Error in global error handler', e && e.stack ? e.stack : e);

@@ -1,7 +1,7 @@
 // controllers/adminAuthController.js
 const AdminModel = require('../models/AdminModel');
 const AuthTokenModel = require('../models/AuthTokenModel');
-const bcrypt = require('bcrypt');
+const bcrypt = require('bcryptjs');
 
 const TOKEN_TTL_SECONDS = Number(process.env.ADMIN_TOKEN_TTL_SECONDS || 60 * 60 * 8); // 8 hours default
 const BCRYPT_ROUNDS = Number(process.env.BCRYPT_ROUNDS || 12);
@@ -16,7 +16,7 @@ async function login(req, res) {
 
     if (user.role !== 'admin') return res.status(403).json({ error: 'forbidden' });
 
-    const ok = await bcrypt.compare(password, user.password_hash);
+    const ok = bcrypt.compareSync(password, user.password_hash);
     if (!ok) return res.status(401).json({ error: 'invalid credentials' });
 
     const { token, id, expiresAt } = await AuthTokenModel.createToken({

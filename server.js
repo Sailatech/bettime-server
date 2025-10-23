@@ -1,15 +1,23 @@
+// app.js
 require('dotenv').config();
 
 const express = require('express');
 const helmet = require('helmet');
 const cors = require('cors');
 const path = require('path');
+const cookieParser = require('cookie-parser');
 
 const db = require('./config/db');
 const { initializeDatabase, getPool, closePool } = db;
-const routes = require('./routes');
+const routes = require('./routes'); // main public API routes index
 const authMiddleware = require('./middleware/auth');
 const gameController = require('./controllers/gameController');
+const { ensureAdminFromEnv } = require('./boot/admin-seed');
+
+// admin routes
+const adminAuthRouter = require('./routes/adminAuth');
+const adminWithdrawalsRouter = require('./routes/adminWithdrawals');
+const adminTablesRouter = require('./routes/adminTables');
 
 const app = express();
 
@@ -21,7 +29,7 @@ const rawOrigins = (process.env.FRONTEND_ORIGIN || process.env.CORS_ORIGIN || ''
 const allowedOrigins = rawOrigins ? rawOrigins.split(',').map(s => s.trim()).filter(Boolean) : [];
 
 if (allowedOrigins.length === 0) {
-  console.warn('WARNING: FRONTEND_ORIGIN not set. Set FRONTEND_ORIGIN to your front-end URL e.g. https://bettime.onrender.com');
+  console.warn('WARNING: FRONTEND_ORIGIN not set. Set FRONTEND_ORIGIN to your front-end URL e.g. https://your-frontend.example.com');
 } else {
   console.log('CORS allowed origins:', allowedOrigins);
 }
@@ -48,14 +56,6 @@ const corsOptions = {
   maxAge: 600
 };
 
-// Log preflight requests for debugging
-app.use((req, res, next) => {
-  if (req.method === 'OPTIONS') {
-    console.log('Preflight request', { origin: req.get('Origin'), path: req.path });
-  }
-  next();
-});
-
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions)); // ensure preflight handled
 
@@ -72,6 +72,7 @@ app.use(
   })
 );
 app.use(express.urlencoded({ extended: true }));
+app.use(cookieParser());
 
 // Basic startup log
 console.log('SERVER STARTING', {
@@ -88,8 +89,15 @@ app.get('/payments/paystack-callback', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'paystack-callback.html'));
 });
 
-// Mount API routes under /api
+// Mount public API routes under /api
 app.use('/api', routes);
+
+// Mount admin auth route (public login, protected logout)
+app.use('/admin/auth', adminAuthRouter);
+
+// Mount admin-only routers; they internally use auth + ensureAdmin middleware
+app.use('/admin/withdrawals', adminWithdrawalsRouter);
+app.use('/admin/tables', adminTablesRouter);
 
 // Example protected route to verify auth middleware is wired correctly
 app.get('/api/me', authMiddleware, async (req, res) => {
@@ -114,19 +122,13 @@ app.use((err, req, res, next) => {
 
 const PORT = Number(process.env.PORT || 4000);
 
-// startup hints
-console.log('PAYSTACK_SECRET present:', !!(process.env.PAYSTACK_SECRET || process.env.PAYSTACK_SECRET_KEY));
-if (process.env.FRONTEND_CALLBACK_URL) {
-  console.log('FRONTEND_CALLBACK_URL:', process.env.FRONTEND_CALLBACK_URL);
-} else {
-  console.log('Tip: set FRONTEND_CALLBACK_URL to your /payments/paystack-callback URL for Paystack init e.g. http://localhost:4000/payments/paystack-callback');
-}
-
+// startup helpers
 let cleanupControllerHandle = null;
 let serverInstance = null;
 
 async function start() {
   try {
+    // initialize DB and ensure schema
     await initializeDatabase();
     const pool = await getPool();
 
@@ -134,7 +136,15 @@ async function start() {
     const conn = await pool.getConnection();
     conn.release();
 
-    // start periodic DB cleanup via gameController
+    // idempotent admin seeding from env (creates admin user if ADMIN_* vars present)
+    try {
+      await ensureAdminFromEnv();
+    } catch (e) {
+      console.error('Admin seed error', e && e.stack ? e.stack : e);
+      // do not stop startup on seeder failure unless you prefer to
+    }
+
+    // start periodic DB cleanup via gameController (optional)
     try {
       if (gameController && typeof gameController.startPeriodicCleanup === 'function') {
         cleanupControllerHandle = gameController.startPeriodicCleanup({
@@ -156,7 +166,7 @@ async function start() {
       }
     }
 
-    // ensure we bind to 0.0.0.0 for Render
+    // bind server
     serverInstance = app.listen(PORT, '0.0.0.0', () => {
       console.log(`Server listening on port ${PORT}`);
     });

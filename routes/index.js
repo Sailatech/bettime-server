@@ -2,7 +2,6 @@ const express = require('express');
 const router = express.Router();
 
 router.use('/auth', require('./auth'));
-router.use('/admin', require('./admin'));
 router.use('/withdrawals', require('./withdrawal'));
 router.use('/payments', require('./payment'));
 router.use('/internal', require('./internal'));

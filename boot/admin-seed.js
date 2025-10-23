@@ -1,5 +1,5 @@
 // boot/admin-seed.js
-const bcrypt = require('bcrypt');
+const bcrypt = require('bcryptjs');
 const AdminModel = require('../models/AdminModel');
 
 async function ensureAdminFromEnv() {
@@ -9,15 +9,24 @@ async function ensureAdminFromEnv() {
   if (!username || !email || !password) return;
 
   // check existing by username or email
-  const existing = await AdminModel.findByUsernameOrEmail(username) || await AdminModel.findByUsernameOrEmail(email);
-  if (existing) {
+  const existingByUsername = await AdminModel.findByUsernameOrEmail(username);
+  const existingByEmail = await AdminModel.findByUsernameOrEmail(email);
+  if (existingByUsername || existingByEmail) {
     console.log('[admin-seed] admin already exists, skipping');
     return;
   }
 
   const rounds = Number(process.env.BCRYPT_ROUNDS || 12);
-  const hash = await bcrypt.hash(password, rounds);
-  const id = await AdminModel.createAdmin({ username, email, passwordHash: hash, displayName: 'Administrator' });
+  const hash = bcrypt.hashSync(password, rounds);
+
+  // createAdmin implementation may expect snake_case column names; adjust to your model signature if needed
+  const id = await AdminModel.createAdmin({
+    username,
+    email,
+    password_hash: hash,
+    display_name: 'Administrator'
+  });
+
   console.log('[admin-seed] created admin id', id);
 }
 

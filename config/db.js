@@ -10,6 +10,8 @@ const BOARD_COLS = 6;
 const BOARD_CELLS = BOARD_ROWS * BOARD_COLS;
 const EMPTY_BOARD = '_'.repeat(BOARD_CELLS);
 
+let pool = null;
+
 /**
  * Parse database connection details from DATABASE_URL or environment vars
  */
@@ -24,10 +26,10 @@ function getDbConfigFromEnv() {
   const sslMode =
     dbUrl.searchParams.get('sslmode') || dbUrl.searchParams.get('ssl-mode');
 
-  // ✅ Aiven and Render both require SSL connections
+  // Aiven and Render both may require SSL connections
   const ssl =
     sslMode && sslMode.toLowerCase().startsWith('req')
-      ? { rejectUnauthorized: false } // accept Aiven’s cert
+      ? { rejectUnauthorized: false }
       : undefined;
 
   return {
@@ -45,7 +47,7 @@ function getDbConfigFromEnv() {
 }
 
 /**
- * Create admin connection config (without database name)
+ * Create admin connection config without database name
  */
 function createAdminConnectionConfig() {
   const cfg = getDbConfigFromEnv();
@@ -58,8 +60,6 @@ function createAdminConnectionConfig() {
     connectTimeout: cfg.connectTimeout
   };
 }
-
-let pool = null;
 
 /**
  * Ensure the database exists before connecting
@@ -101,7 +101,7 @@ async function getPool() {
     queueLimit: 0,
     timezone: 'Z',
     connectTimeout: cfg.connectTimeout,
-    ssl: cfg.ssl // ✅ Aiven needs SSL
+    ssl: cfg.ssl
   };
 
   pool = mysql.createPool(poolOptions);
@@ -109,7 +109,7 @@ async function getPool() {
 }
 
 /**
- * Calculate charge for an amount (used for bets, withdrawals)
+ * Calculate charge for an amount
  */
 async function getChargeForAmount(dbClient, amount) {
   const MIN_AMOUNT_THRESHOLD = 100.0;
@@ -159,7 +159,7 @@ async function getChargeForAmount(dbClient, amount) {
 }
 
 /**
- * Create all database tables
+ * Create all database tables including api_keys
  */
 async function initializeDatabase() {
   const db = await getPool();
@@ -362,6 +362,22 @@ async function initializeDatabase() {
       name VARCHAR(255) NOT NULL,
       applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       UNIQUE KEY uniq_name (name)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+  `);
+
+  // API KEYS table
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS api_keys (
+      id BIGINT PRIMARY KEY AUTO_INCREMENT,
+      name VARCHAR(128) NOT NULL,
+      key_hash VARCHAR(512) NOT NULL,
+      created_by_admin TINYINT(1) DEFAULT 1,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      last_used_at TIMESTAMP NULL,
+      revoked_at TIMESTAMP NULL,
+      meta JSON DEFAULT NULL,
+      UNIQUE KEY uniq_name (name),
+      INDEX (revoked_at)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
   `);
 

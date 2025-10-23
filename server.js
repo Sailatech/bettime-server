@@ -13,6 +13,10 @@ const authMiddleware = require('./middleware/auth');
 const gameController = require('./controllers/gameController');
 const { ensureAdminFromEnv } = require('./boot/admin-seed');
 
+// New: API key middleware and admin API-key route
+const apiKeyAuth = require('./middleware/apiKeyAuth'); // validate client requests using x-api-key or Authorization: ApiKey <key>
+const adminApiKeysRouter = require('./routes/adminApiKeys'); // admin endpoint to create/list/revoke/rotate keys
+
 const adminAuthRouter = require('./routes/adminAuth');
 const adminWithdrawalsRouter = require('./routes/adminWithdrawals');
 const adminTablesRouter = require('./routes/adminTables');
@@ -54,7 +58,7 @@ const corsOptions = {
     return callback(new Error('Not allowed by CORS'));
   },
   methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'x-api-key'],
   credentials: true,
   optionsSuccessStatus: 204,
   maxAge: 600
@@ -98,6 +102,9 @@ app.use('/api', routes);
 // Mount admin auth route (public login, protected logout)
 app.use('/admin/auth', adminAuthRouter);
 
+// Mount admin API-keys management (protected by your existing admin middleware inside the router)
+app.use('/admin/api-keys', adminApiKeysRouter);
+
 // Mount admin-only routers; they internally use auth + ensureAdmin middleware
 app.use('/admin/withdrawals', adminWithdrawalsRouter);
 app.use('/admin/tables', adminTablesRouter);
@@ -106,6 +113,13 @@ app.use('/admin/tables', adminTablesRouter);
 app.get('/api/me', authMiddleware, async (req, res) => {
   if (!req.user) return res.status(401).json({ error: 'Unauthorized' });
   res.json({ user: { id: req.user.id, username: req.user.username, email: req.user.email, balance: req.user.balance } });
+});
+
+// Example route accessible to external clients via API key
+// Place real public endpoints under /api/public or similar and protect with apiKeyAuth
+app.get('/api/external-data', apiKeyAuth, async (req, res) => {
+  // req.apiKey is set by middleware and contains id, name, meta, lastUsedAt
+  res.json({ ok: true, apiKey: req.apiKey || null, data: { message: 'external data' } });
 });
 
 // Global error handler (ensures a body is always returned)
@@ -130,7 +144,7 @@ let serverInstance = null;
 
 async function start() {
   try {
-    // initialize DB and ensure schema
+    // initialize DB and ensure schema (includes api_keys table if configured in config/db.js)
     await initializeDatabase();
     const pool = await getPool();
 

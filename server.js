@@ -1,4 +1,3 @@
-// app.js
 require('dotenv').config();
 
 const express = require('express');
@@ -9,12 +8,11 @@ const cookieParser = require('cookie-parser');
 
 const db = require('./config/db');
 const { initializeDatabase, getPool, closePool } = db;
-const routes = require('./routes'); // main public API routes index
+const routes = require('./routes');
 const authMiddleware = require('./middleware/auth');
 const gameController = require('./controllers/gameController');
 const { ensureAdminFromEnv } = require('./boot/admin-seed');
 
-// admin routes
 const adminAuthRouter = require('./routes/adminAuth');
 const adminWithdrawalsRouter = require('./routes/adminWithdrawals');
 const adminTablesRouter = require('./routes/adminTables');
@@ -26,7 +24,13 @@ app.use(helmet());
 
 // CORS configuration - supports single origin or comma-separated list in FRONTEND_ORIGIN / CORS_ORIGIN
 const rawOrigins = (process.env.FRONTEND_ORIGIN || process.env.CORS_ORIGIN || '').trim();
-const allowedOrigins = rawOrigins ? rawOrigins.split(',').map(s => s.trim()).filter(Boolean) : [];
+let allowedOrigins = rawOrigins ? rawOrigins.split(',').map(s => s.trim()).filter(Boolean) : [];
+
+// ensure admin panel origin is included
+const ADMIN_PANEL_ORIGIN = 'https://bettime-adminpanel.onrender.com';
+if (!allowedOrigins.includes(ADMIN_PANEL_ORIGIN)) {
+  allowedOrigins.push(ADMIN_PANEL_ORIGIN);
+}
 
 if (allowedOrigins.length === 0) {
   console.warn('WARNING: FRONTEND_ORIGIN not set. Set FRONTEND_ORIGIN to your front-end URL e.g. https://your-frontend.example.com');
@@ -57,7 +61,7 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
-app.options('*', cors(corsOptions)); // ensure preflight handled
+app.options('*', cors(corsOptions));
 
 // Serve static files from ./public so the Paystack callback page can be same-origin
 app.use(express.static(path.join(__dirname, 'public')));
@@ -74,7 +78,6 @@ app.use(
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 
-// Basic startup log
 console.log('SERVER STARTING', {
   env: process.env.NODE_ENV || null,
   portEnv: process.env.PORT || null,
@@ -114,7 +117,6 @@ app.use((err, req, res, next) => {
     if (process.env.NODE_ENV !== 'production' && err.stack) payload.stack = err.stack;
     res.status(status).json(payload);
   } catch (e) {
-    // Last-resort fallback if error handler itself fails
     console.error('Error in global error handler', e && e.stack ? e.stack : e);
     try { res.status(500).json({ error: 'Critical server error' }); } catch (_) {}
   }
@@ -141,7 +143,6 @@ async function start() {
       await ensureAdminFromEnv();
     } catch (e) {
       console.error('Admin seed error', e && e.stack ? e.stack : e);
-      // do not stop startup on seeder failure unless you prefer to
     }
 
     // start periodic DB cleanup via gameController (optional)

@@ -7,20 +7,23 @@ const cors = require('cors');
 const path = require('path');
 const cookieParser = require('cookie-parser');
 
-const rateLimit = require('express-rate-limit');
+let rateLimit;
+try {
+  rateLimit = require('express-rate-limit');
+} catch (e) {
+  rateLimit = null;
+}
 
 let RedisStore;
 let IORedis;
 const REDIS_URL = process.env.REDIS_URL || '';
 
 try {
-  // optional: try to require Redis store libs if available
   IORedis = require('ioredis');
   RedisStore = require('rate-limit-redis');
 } catch (e) {
   RedisStore = null;
   IORedis = null;
-  // if not installed, we'll use the memory store from express-rate-limit
 }
 
 const db = require('./config/db');
@@ -39,7 +42,6 @@ const adminTablesRouter = require('./routes/adminTables');
 const app = express();
 
 // ---- Trust proxy ----
-// Trusting 1 proxy hop by default (adjust via TRUST_PROXY env for your infra)
 const TRUST_PROXY = process.env.TRUST_PROXY || '1';
 app.set('trust proxy', TRUST_PROXY);
 
@@ -54,7 +56,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// CORS configuration - same as before
+// CORS configuration
 const rawOrigins = (process.env.FRONTEND_ORIGIN || process.env.CORS_ORIGIN || '').trim();
 let allowedOrigins = rawOrigins ? rawOrigins.split(',').map(s => s.trim()).filter(Boolean) : [];
 const ADMIN_PANEL_ORIGIN = 'https://bettime-adminpanel.onrender.com';
@@ -106,94 +108,38 @@ console.log('SERVER STARTING', {
 });
 
 // ---- Rate limiting configuration ----
-const DISABLE_RATE_LIMIT = String(process.env.DISABLE_RATE_LIMIT || 'false').toLowerCase() === 'true';
+// Force-disable rate limiting regardless of env: use no-op middlewares
+const DISABLE_RATE_LIMIT = true; // forced true to disable rate limiting
 
-// Build a store for express-rate-limit: Redis if configured, otherwise fallback to memory store
+// Provide no-op store variable (for compatibility)
 let rateLimitStore = null;
-if (!DISABLE_RATE_LIMIT && RedisStore && IORedis && REDIS_URL) {
-  try {
-    const client = new IORedis(REDIS_URL);
-    rateLimitStore = new RedisStore({
-      sendCommand: (...args) => client.call(...args)
-    });
-    console.log('Using Redis-backed rate limit store');
-  } catch (e) {
-    console.warn('Could not initialize Redis rate limit store, falling back to memory store', e && e.stack ? e.stack : e);
-    rateLimitStore = null;
-  }
-}
 
-// Helper for logging when a limit is hit
+// Helper for logging when a limit would have been hit
 function onLimitReached(req, res, options) {
   const key = req.ip || req.connection.remoteAddress || 'unknown';
-  console.warn(`[RATE-LIMIT] ${options.name || 'limit'} reached for key=${key} path=${req.originalUrl}`);
+  console.warn(`[RATE-LIMIT - DISABLED] ${options.name || 'limit'} would have been hit for key=${key} path=${req.originalUrl}`);
 }
 
-// Global lightweight limiter (per-IP)
-const globalLimiter = DISABLE_RATE_LIMIT
-  ? (req, res, next) => next()
-  : rateLimit({
-      windowMs: Number(process.env.GLOBAL_RATE_WINDOW_MS || 60 * 1000),
-      max: Number(process.env.GLOBAL_RATE_MAX || 2000),
-      standardHeaders: true,
-      legacyHeaders: false,
-      handler: (req, res) => {
-        onLimitReached(req, res, { name: 'global' });
-        res.status(429).json({ error: 'Too many requests (global). Try again later.' });
-      },
-      store: rateLimitStore || undefined,
-      keyGenerator: (req) => req.ip || req.connection.remoteAddress
-    });
-
+// Global limiter no-op (unlimited requests)
+const globalLimiter = (req, res, next) => next();
 app.use(globalLimiter);
 
-// Strict limiter for auth-looking endpoints (login) to mitigate brute-force
-const authLimitWindow = Number(process.env.AUTH_RATE_WINDOW_MS || 60 * 1000);
-const authLimitMax = Number(process.env.AUTH_RATE_MAX || 10); // default 10 attempts per minute per IP
-const authLimiter = DISABLE_RATE_LIMIT
-  ? (req, res, next) => next()
-  : rateLimit({
-      windowMs: authLimitWindow,
-      max: authLimitMax,
-      standardHeaders: true,
-      legacyHeaders: false,
-      handler: (req, res) => {
-        onLimitReached(req, res, { name: 'auth' });
-        res.set('Retry-After', Math.ceil(authLimitWindow / 1000));
-        res.status(429).json({ error: 'Too many login attempts. Try again later.' });
-      },
-      store: rateLimitStore || undefined,
-      keyGenerator: (req) => req.ip || req.connection.remoteAddress
-    });
+// Auth limiter no-op
+const authLimiter = (req, res, next) => next();
 
-// Optional: lightweight endpoint-specific limiter for sensitive operations other than login
-const sensitiveLimiter = DISABLE_RATE_LIMIT
-  ? (req, res, next) => next()
-  : rateLimit({
-      windowMs: Number(process.env.SENSITIVE_RATE_WINDOW_MS || 60 * 1000),
-      max: Number(process.env.SENSITIVE_RATE_MAX || 200),
-      standardHeaders: true,
-      legacyHeaders: false,
-      handler: (req, res) => {
-        onLimitReached(req, res, { name: 'sensitive' });
-        res.status(429).json({ error: 'Too many requests to this endpoint. Try again later.' });
-      },
-      store: rateLimitStore || undefined,
-      keyGenerator: (req) => req.ip || req.connection.remoteAddress
-    });
+// Sensitive endpoint limiter no-op
+const sensitiveLimiter = (req, res, next) => next();
 
 // ---- Account-level failed login lockout (in-memory simple implementation) ----
-// NOTE: for production use persistent storage Redis or DB to survive restarts and scale across instances
-const failedLoginAttempts = new Map(); // key: identifier (email or username), value: { count, firstAttemptTs, lockedUntilTs }
-const ACCOUNT_LOCK_THRESHOLD = Number(process.env.ACCOUNT_LOCK_THRESHOLD || 5); // e.g., lock after 5 failed attempts
-const ACCOUNT_LOCK_WINDOW_MS = Number(process.env.ACCOUNT_LOCK_WINDOW_MS || 15 * 60 * 1000); // count window
-const ACCOUNT_LOCK_DURATION_MS = Number(process.env.ACCOUNT_LOCK_DURATION_MS || 15 * 60 * 1000); // lock duration
+const failedLoginAttempts = new Map();
+const ACCOUNT_LOCK_THRESHOLD = Number(process.env.ACCOUNT_LOCK_THRESHOLD || 5);
+const ACCOUNT_LOCK_WINDOW_MS = Number(process.env.ACCOUNT_LOCK_WINDOW_MS || 15 * 60 * 1000);
+const ACCOUNT_LOCK_DURATION_MS = Number(process.env.ACCOUNT_LOCK_DURATION_MS || 15 * 60 * 1000);
 
 function recordFailedLogin(identifier) {
   if (!identifier) return;
   const now = Date.now();
   const prev = failedLoginAttempts.get(identifier) || { count: 0, firstAttemptTs: now, lockedUntilTs: 0 };
-  // reset window if first attempt older than window
   if (now - prev.firstAttemptTs > ACCOUNT_LOCK_WINDOW_MS) {
     prev.count = 0;
     prev.firstAttemptTs = now;
@@ -216,7 +162,6 @@ function isAccountLocked(identifier) {
   const rec = failedLoginAttempts.get(identifier);
   if (!rec) return false;
   if (rec.lockedUntilTs && rec.lockedUntilTs > now) return true;
-  // if lockedUntil expired, reset record
   if (rec.lockedUntilTs && rec.lockedUntilTs <= now) {
     failedLoginAttempts.delete(identifier);
     return false;
@@ -232,16 +177,14 @@ app.get('/payments/paystack-callback', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'paystack-callback.html'));
 });
 
-// API guard function unchanged (keeps apiKeyAuth and authMiddleware behavior)
+// API guard function unchanged
 async function apiKeyOrSessionGuard(req, res, next) {
   try {
-    let called = false;
     const maybeNextFromApiKey = () =>
       new Promise((resolve, reject) => {
         apiKeyAuth(req, res, (err) => {
           if (err) return reject(err);
           if (req.apiKey) {
-            called = true;
             return resolve(true);
           }
           resolve(false);
@@ -249,13 +192,11 @@ async function apiKeyOrSessionGuard(req, res, next) {
       });
     const apiKeyResult = await maybeNextFromApiKey().catch(() => false);
     if (apiKeyResult === true) return next();
-    let sessionPassed = false;
     const maybeSession = () =>
       new Promise((resolve, reject) => {
         authMiddleware(req, res, (err) => {
           if (err) return reject(err);
           if (req.user) {
-            sessionPassed = true;
             return resolve(true);
           }
           resolve(false);
@@ -270,16 +211,16 @@ async function apiKeyOrSessionGuard(req, res, next) {
   }
 }
 
-// Mount /api with guard that requires API key or session
+// Mount /api with guard
 app.use('/api', apiKeyOrSessionGuard, routes);
 
-// Admin and other routers as before
+// Admin and other routers
 app.use('/admin/auth', adminAuthRouter);
 app.use('/admin/api-keys', adminApiKeysRouter);
 app.use('/admin/withdrawals', adminWithdrawalsRouter);
 app.use('/admin/tables', adminTablesRouter);
 
-// Example protected routes unchanged...
+// Example protected routes
 app.get('/api/me', authMiddleware, async (req, res) => {
   if (!req.user) return res.status(401).json({ error: 'Unauthorized' });
   res.json({ user: { id: req.user.id, username: req.user.username, email: req.user.email, balance: req.user.balance } });
@@ -289,8 +230,6 @@ app.get('/api/external-data', async (req, res) => {
 });
 
 // ---- Auth/login route override with extra protections ----
-// If your existing adminAuthRouter or routes already handle /api/auth/login, you can keep them.
-// This demonstrates wrapping the login endpoint with account lockout + ip limiter + optional captcha step.
 app.post('/api/auth/login', authLimiter, async (req, res, next) => {
   try {
     const identifier = (req.body && (req.body.email || req.body.username || req.body.identifier)) || null;
@@ -303,14 +242,7 @@ app.post('/api/auth/login', authLimiter, async (req, res, next) => {
       return res.status(429).json({ error: 'Account locked due to repeated failed login attempts. Try again later.' });
     }
 
-    // 2) Forward request to your existing login handler (the same as before)
-    // If your adminAuthRouter expects the request routed there, call next to let the router handle it.
-    // Otherwise, call into your existing code to authenticate.
-    // Here we delegate to the adminAuthRouter route by forwarding the request to that router's handler.
-    // To avoid duplicate registration, ensure adminAuthRouter also handles POST /auth/login or adapt accordingly.
-    // We'll call next() to let other route handlers (mounted at /admin/auth or /api) process this request.
-    // But since you already mount adminAuthRouter at /admin/auth, and your routes may handle /api/auth/login,
-    // we forward to existing routes by calling next() - ensure there is a matching handler mounted.
+    // 2) Forward to existing handler (delegate to downstream routes or router)
     return next();
   } catch (err) {
     console.error('[login wrapper] error', err && err.stack ? err.stack : err);
@@ -318,12 +250,9 @@ app.post('/api/auth/login', authLimiter, async (req, res, next) => {
   }
 });
 
-// To record failures and successes, ensure the actual login handler (inside your routes or adminAuthRouter)
-// calls back to these helpers. You may either modify that handler to call `recordFailedLogin(identifier)`
-// on authentication failure and `clearFailedLogin(identifier)` on success.
-// Example: inside your login controller, on failed auth => recordFailedLogin(email); on success => clearFailedLogin(email);
+// Note: ensure your actual login handler calls recordFailedLogin(identifier) on failure and clearFailedLogin(identifier) on success
 
-// ---- Global error handler (unchanged) ----
+// ---- Global error handler ----
 app.use((err, req, res, next) => {
   try {
     console.error('Unhandled error', err && err.stack ? err.stack : err);
@@ -344,7 +273,7 @@ app.use((err, req, res, next) => {
   }
 });
 
-// ---- Startup and shutdown (unchanged) ----
+// ---- Startup and shutdown ----
 const PORT = Number(process.env.PORT || 4000);
 let cleanupControllerHandle = null;
 let serverInstance = null;
@@ -380,6 +309,7 @@ async function start() {
 
     serverInstance = app.listen(PORT, '0.0.0.0', () => {
       console.log(`Server listening on port ${PORT}`);
+      console.log('Rate limiting disabled: true (no-op middlewares in use)');
     });
 
     const gracefulShutdown = async () => {

@@ -26,9 +26,10 @@ try {
   IORedis = null;
 }
 
+// application modules
 const db = require('./config/db');
 const { initializeDatabase, getPool, closePool } = db;
-const routes = require('./routes');
+const routes = require('./routes'); // your router that mounts /auth, /withdrawals, /payments, /internal, /games, etc.
 const authMiddleware = require('./middleware/auth');
 const gameController = require('./controllers/gameController');
 const { ensureAdminFromEnv } = require('./boot/admin-seed');
@@ -38,6 +39,10 @@ const adminApiKeysRouter = require('./routes/adminApiKeys');
 const adminAuthRouter = require('./routes/adminAuth');
 const adminWithdrawalsRouter = require('./routes/adminWithdrawals');
 const adminTablesRouter = require('./routes/adminTables');
+
+const proxyRouter = require('./server/proxy'); // optional: separate proxy router (queue + retry); create this file if you need outbound proxying
+// Lockout utilities moved to lib/lockout.js (see comments below)
+const lockout = require('./lib/lockout');
 
 const app = express();
 
@@ -77,14 +82,16 @@ const corsOptions = {
     return callback(new Error('Not allowed by CORS'));
   },
   methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'x-api-key'],
-  exposedHeaders: ['Content-Length'],
+  // IMPORTANT: do NOT include 'x-api-key' here so browsers will not attempt to send it
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept'],
+  exposedHeaders: ['Content-Length', 'Retry-After'],
   credentials: true,
   optionsSuccessStatus: 204,
   maxAge: 600
 };
 app.use(cors(corsOptions));
-app.options('*', cors(corsOptions));
+// short-circuit preflight to avoid extra forwarding work
+app.options('*', cors(corsOptions), (req, res) => res.sendStatus(204));
 
 // Serve static files and body parsers
 app.use(express.static(path.join(__dirname, 'public')));
@@ -108,66 +115,25 @@ console.log('SERVER STARTING', {
 });
 
 // ---- Rate limiting configuration ----
-// Force-disable rate limiting regardless of env: use no-op middlewares
+// Force-disable rate limiting regardless of env: use no-op middlewares by default
 const DISABLE_RATE_LIMIT = true; // forced true to disable rate limiting
-
-// Provide no-op store variable (for compatibility)
-let rateLimitStore = null;
-
-// Helper for logging when a limit would have been hit
-function onLimitReached(req, res, options) {
-  const key = req.ip || req.connection.remoteAddress || 'unknown';
-  console.warn(`[RATE-LIMIT - DISABLED] ${options.name || 'limit'} would have been hit for key=${key} path=${req.originalUrl}`);
-}
 
 // Global limiter no-op (unlimited requests)
 const globalLimiter = (req, res, next) => next();
 app.use(globalLimiter);
 
-// Auth limiter no-op
+// Auth limiter no-op (kept in place so you can swap in a real limiter later)
 const authLimiter = (req, res, next) => next();
 
 // Sensitive endpoint limiter no-op
 const sensitiveLimiter = (req, res, next) => next();
 
-// ---- Account-level failed login lockout (in-memory simple implementation) ----
-const failedLoginAttempts = new Map();
-const ACCOUNT_LOCK_THRESHOLD = Number(process.env.ACCOUNT_LOCK_THRESHOLD || 5);
-const ACCOUNT_LOCK_WINDOW_MS = Number(process.env.ACCOUNT_LOCK_WINDOW_MS || 15 * 60 * 1000);
-const ACCOUNT_LOCK_DURATION_MS = Number(process.env.ACCOUNT_LOCK_DURATION_MS || 15 * 60 * 1000);
-
-function recordFailedLogin(identifier) {
-  if (!identifier) return;
-  const now = Date.now();
-  const prev = failedLoginAttempts.get(identifier) || { count: 0, firstAttemptTs: now, lockedUntilTs: 0 };
-  if (now - prev.firstAttemptTs > ACCOUNT_LOCK_WINDOW_MS) {
-    prev.count = 0;
-    prev.firstAttemptTs = now;
-    prev.lockedUntilTs = 0;
-  }
-  prev.count += 1;
-  if (prev.count >= ACCOUNT_LOCK_THRESHOLD) {
-    prev.lockedUntilTs = now + ACCOUNT_LOCK_DURATION_MS;
-    console.warn(`[LOCKOUT] account ${identifier} locked until ${new Date(prev.lockedUntilTs).toISOString()}`);
-  }
-  failedLoginAttempts.set(identifier, prev);
-}
-function clearFailedLogin(identifier) {
-  if (!identifier) return;
-  failedLoginAttempts.delete(identifier);
-}
-function isAccountLocked(identifier) {
-  if (!identifier) return false;
-  const now = Date.now();
-  const rec = failedLoginAttempts.get(identifier);
-  if (!rec) return false;
-  if (rec.lockedUntilTs && rec.lockedUntilTs > now) return true;
-  if (rec.lockedUntilTs && rec.lockedUntilTs <= now) {
-    failedLoginAttempts.delete(identifier);
-    return false;
-  }
-  return false;
-}
+// ---- Account-level failed login lockout utilities are in lib/lockout.js ----
+// Ensure lib/lockout exports: { recordFailedLogin, clearFailedLogin, isAccountLocked, ACCOUNT_LOCK_THRESHOLD, ACCOUNT_LOCK_WINDOW_MS, ACCOUNT_LOCK_DURATION_MS }
+// Example: const lockout = require('./lib/lockout');
+// call lockout.recordFailedLogin(identifier) from your auth controller on failed attempts
+// call lockout.clearFailedLogin(identifier) on successful login
+// use lockout.isAccountLocked(identifier) in your auth controller to return 429 + Retry-After
 
 // Health check
 app.get('/healthz', (req, res) => res.json({ status: 'ok' }));
@@ -177,50 +143,17 @@ app.get('/payments/paystack-callback', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'paystack-callback.html'));
 });
 
-// API guard function unchanged
-async function apiKeyOrSessionGuard(req, res, next) {
-  try {
-    const maybeNextFromApiKey = () =>
-      new Promise((resolve, reject) => {
-        apiKeyAuth(req, res, (err) => {
-          if (err) return reject(err);
-          if (req.apiKey) {
-            return resolve(true);
-          }
-          resolve(false);
-        });
-      });
-    const apiKeyResult = await maybeNextFromApiKey().catch(() => false);
-    if (apiKeyResult === true) return next();
-    const maybeSession = () =>
-      new Promise((resolve, reject) => {
-        authMiddleware(req, res, (err) => {
-          if (err) return reject(err);
-          if (req.user) {
-            return resolve(true);
-          }
-          resolve(false);
-        });
-      });
-    const sessionResult = await maybeSession().catch(() => false);
-    if (sessionResult === true) return next();
-    return res.status(401).json({ error: 'API key or session required' });
-  } catch (err) {
-    console.error('[apiKeyOrSessionGuard] error', err && err.stack ? err.stack : err);
-    return res.status(500).json({ error: 'Auth guard error' });
-  }
-}
+// ---- Mount API routes (main router handles /auth, /withdrawals, /payments, /internal, /games, etc.) ----
+// The routes module should include the login handler and perform lockout checks via lib/lockout utilities
+app.use('/api', routes);
 
-// Mount /api with guard
-app.use('/api', apiKeyOrSessionGuard, routes);
-
-// Admin and other routers
+// ---- Admin and other routers ----
 app.use('/admin/auth', adminAuthRouter);
 app.use('/admin/api-keys', adminApiKeysRouter);
 app.use('/admin/withdrawals', adminWithdrawalsRouter);
 app.use('/admin/tables', adminTablesRouter);
 
-// Example protected routes
+// ---- Example protected endpoints (keep as convenience) ----
 app.get('/api/me', authMiddleware, async (req, res) => {
   if (!req.user) return res.status(401).json({ error: 'Unauthorized' });
   res.json({ user: { id: req.user.id, username: req.user.username, email: req.user.email, balance: req.user.balance } });
@@ -229,28 +162,24 @@ app.get('/api/external-data', async (req, res) => {
   res.json({ ok: true, apiKey: req.apiKey || null, user: req.user ? { id: req.user.id, username: req.user.username } : null, data: { message: 'external data' } });
 });
 
-// ---- Auth/login route override with extra protections ----
-app.post('/api/auth/login', authLimiter, async (req, res, next) => {
-  try {
-    const identifier = (req.body && (req.body.email || req.body.username || req.body.identifier)) || null;
-
-    // 1) If account is currently locked, respond with 429 and Retry-After
-    if (isAccountLocked(identifier)) {
-      const rec = failedLoginAttempts.get(identifier) || {};
-      const retryAfterSec = rec.lockedUntilTs ? Math.ceil((rec.lockedUntilTs - Date.now()) / 1000) : 60;
-      res.set('Retry-After', String(retryAfterSec));
-      return res.status(429).json({ error: 'Account locked due to repeated failed login attempts. Try again later.' });
-    }
-
-    // 2) Forward to existing handler (delegate to downstream routes or router)
-    return next();
-  } catch (err) {
-    console.error('[login wrapper] error', err && err.stack ? err.stack : err);
-    return res.status(500).json({ error: 'Login processing error' });
+// ---- Proxy router (outbound proxy/queue) ----
+// Mount the proxy router under /proxy if you need to forward requests to an external MAIN_API.
+// Keep proxy logic separate so it does not affect internal route handling.
+// Implement server/proxy.js with queue/retry logic and ensure it strips/forbids browser-sent server-only headers.
+// If you do not need a proxy, you can remove this mount.
+try {
+  if (proxyRouter && typeof proxyRouter === 'function') {
+    app.use('/proxy', proxyRouter());
+    console.log('Proxy router mounted at /proxy');
+  } else if (proxyRouter) {
+    app.use('/proxy', proxyRouter);
+    console.log('Proxy router mounted at /proxy');
+  } else {
+    console.log('No proxy router found');
   }
-});
-
-// Note: ensure your actual login handler calls recordFailedLogin(identifier) on failure and clearFailedLogin(identifier) on success
+} catch (e) {
+  console.warn('Proxy router could not be mounted:', e && e.stack ? e.stack : e);
+}
 
 // ---- Global error handler ----
 app.use((err, req, res, next) => {

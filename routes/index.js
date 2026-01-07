@@ -8,4 +8,7 @@ router.use('/internal', require('./internal'));
 // Mount new games routes (matchmaking, join, moves, etc.)
 router.use('/games', require('./games'));
 
+// Mount history routes (match history, moves, recent feed, SSE playback)
+router.use('/history', require('./history'));
+
 module.exports = router;

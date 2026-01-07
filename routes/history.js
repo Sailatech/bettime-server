@@ -48,6 +48,29 @@ function wrapHandler(actionName, handler) {
 }
 
 /**
+ * Internal publish protection middleware
+ * - If INTERNAL_PUBLISH_SECRET is set, require X-INTERNAL-SECRET header to match.
+ * - Otherwise allow only requests from localhost (127.0.0.1 / ::1).
+ */
+function requireInternalSecret(req, res, next) {
+  try {
+    const secret = process.env.INTERNAL_PUBLISH_SECRET || '';
+    if (secret) {
+      const header = req.get('X-INTERNAL-SECRET') || '';
+      if (header === secret) return next();
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    // no secret configured: allow only localhost by default
+    const ip = (req.ip || req.connection?.remoteAddress || '').replace('::ffff:', '');
+    if (ip === '127.0.0.1' || ip === '::1') return next();
+    return res.status(403).json({ error: 'Forbidden' });
+  } catch (e) {
+    console.error('requireInternalSecret error', e && e.stack ? e.stack : e);
+    return res.status(500).json({ error: 'Server error' });
+  }
+}
+
+/**
  * History routes
  *
  * - GET /history/matches
@@ -63,8 +86,12 @@ function wrapHandler(actionName, handler) {
  * - GET /history/recent
  *     Get recent matches across the platform (public) for feed/leaderboard.
  *
- * - GET /history/stream/:id
- *     Optional: SSE stream for historical updates for a match (if you want realtime playback).
+ * - GET /history/stream
+ *     SSE stream for match updates. Optional query param: ?matchId=123
+ *
+ * - POST /history/publish
+ *     Internal endpoint for services (simulator) to publish match updates to SSE clients.
+ *     Protected by INTERNAL_PUBLISH_SECRET or localhost-only if secret not set.
  */
 
 /* List authenticated user's match history */
@@ -95,11 +122,18 @@ router.get(
   wrapHandler('GET /api/history/recent', historyCtrl.getRecentMatches)
 );
 
-/* Optional SSE stream for match history playback (if implemented in controller) */
+/* SSE stream for match updates (optional matchId query param) */
 router.get(
-  '/stream/:id',
+  '/stream',
   auth,
-  wrapHandler('GET /api/history/stream/:id', historyCtrl.streamMatchHistory)
+  wrapHandler('GET /api/history/stream', historyCtrl.streamMatchHistory)
+);
+
+/* Internal publish endpoint for simulator or other internal services */
+router.post(
+  '/publish',
+  requireInternalSecret,
+  wrapHandler('POST /api/history/publish', historyCtrl.publishMatchUpdate)
 );
 
 module.exports = router;

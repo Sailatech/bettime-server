@@ -74,24 +74,12 @@ function requireInternalSecret(req, res, next) {
  * History routes
  *
  * - GET /history/matches
- *     List paginated match history for the authenticated user.
- *     Query params: ?limit=50&offset=0&status=finished
- *
  * - GET /history/matches/:id
- *     Get a single match history record (details) by id (must belong to user or be admin).
- *
  * - GET /history/matches/:id/moves
- *     Get moves for a specific match (paginated).
- *
  * - GET /history/recent
- *     Get recent matches across the platform (public) for feed/leaderboard.
- *
- * - GET /history/stream
- *     SSE stream for match updates. Optional query param: ?matchId=123
- *
- * - POST /history/publish
- *     Internal endpoint for services (simulator) to publish match updates to SSE clients.
- *     Protected by INTERNAL_PUBLISH_SECRET or localhost-only if secret not set.
+ * - GET /history/stream  (SSE)  -> supports ?matchId=...
+ * - GET /history/stream/:id    -> legacy path support
+ * - POST /history/publish     (internal, protected)
  */
 
 /* List authenticated user's match history */
@@ -122,11 +110,33 @@ router.get(
   wrapHandler('GET /api/history/recent', historyCtrl.getRecentMatches)
 );
 
-/* SSE stream for match updates (optional matchId query param) */
+/*
+ * SSE stream for match updates
+ *
+ * NOTE: SSE is often public or cookie-authenticated. If you want to require auth,
+ * add the `auth` middleware back to the route below.
+ *
+ * - /stream supports ?matchId=123
+ * - /stream/:id is supported for legacy clients
+ */
+
+/* Public SSE stream (no auth) */
 router.get(
   '/stream',
-  auth,
+  // auth, // uncomment if you want to require authentication for SSE
   wrapHandler('GET /api/history/stream', historyCtrl.streamMatchHistory)
+);
+
+/* Legacy SSE path that accepts :id in the path and forwards to same handler */
+router.get(
+  '/stream/:id',
+  // auth, // uncomment if you want to require authentication for SSE
+  wrapHandler('GET /api/history/stream/:id', (req, res) => {
+    // normalize to query param and call controller
+    if (!req.query) req.query = {};
+    if (req.params && req.params.id) req.query.matchId = req.params.id;
+    return historyCtrl.streamMatchHistory(req, res);
+  })
 );
 
 /* Internal publish endpoint for simulator or other internal services */

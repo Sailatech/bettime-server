@@ -1,8 +1,13 @@
 // scripts/simulateMatchesInMemory.js
 // In-process simulator that generates simulated matches in memory and calls a provided publish callback.
 // - Does NOT write to DB or call HTTP endpoints.
-// - Exported startSimulator(publishFn, options) returns { stop }.
-// - When run directly, it will start and log to stdout.
+// - Exported startSimulator(publishFn, options) returns { stop, bots }.
+// - When run directly, it will start and log events to stdout.
+//
+// Usage:
+//   const sim = require('./scripts/simulateMatchesInMemory.js');
+//   const runner = await sim.startSimulator((payload) => { /* handle payload */ }, { intervalMs: 60000 });
+//   // runner.stop() to stop
 
 const DEFAULT_NAME_POOL = [
   "John","Joshua","Caleb","Daniel","Matthew","Timothy","Samuel","Isaac","Peter","Joseph","Paul","James",
@@ -31,9 +36,8 @@ function randInt(min, max) {
 function pick(arr) {
   return arr[Math.floor(Math.random() * arr.length)];
 }
-
-function makeId() {
-  return 'sim-' + Math.random().toString(36).slice(2, 9);
+function makeId(prefix = 'sim') {
+  return `${prefix}-${Math.random().toString(36).slice(2, 9)}`;
 }
 
 /**
@@ -56,7 +60,7 @@ async function startSimulator(publishFn, options = {}) {
   // create in-memory bot list (id and displayName)
   for (let i = 0; i < botCount; i++) {
     const displayName = namePool[i];
-    const id = makeId(); // in-memory id
+    const id = makeId('bot');
     bots.push({ id, displayName, username: (displayName.replace(/\s+/g, '_').toLowerCase() + '_' + (i + 1)) });
   }
 
@@ -73,7 +77,7 @@ async function startSimulator(publishFn, options = {}) {
 
     const stake = randInt(minStake, maxStake);
     const now = new Date();
-    const matchId = makeId();
+    const matchId = makeId('match');
 
     const created = {
       id: matchId,
@@ -90,22 +94,31 @@ async function startSimulator(publishFn, options = {}) {
     };
 
     // publish creation event
-    try { publishFn({ type: 'match:create', match: created }); } catch (e) { /* swallow */ }
+    try {
+      publishFn({ type: 'match:create', match: created });
+    } catch (e) {
+      // swallow publish errors to keep simulator running
+      try { console.warn('[sim] publishFn threw', e && e.message ? e.message : e); } catch (_) {}
+    }
 
     // resolve after delay (publish update)
     setTimeout(() => {
-      const winnerIsCreator = Math.random() < 0.5;
-      const winnerId = winnerIsCreator ? a.id : b.id;
-      const resolved = Object.assign({}, created, {
-        winner: winnerId,
-        status: 'finished',
-        updated_at: new Date().toISOString()
-      });
-      try { publishFn({ type: 'match:update', match: resolved }); } catch (e) { /* swallow */ }
+      try {
+        const winnerIsCreator = Math.random() < 0.5;
+        const winnerId = winnerIsCreator ? a.id : b.id;
+        const resolved = Object.assign({}, created, {
+          winner: winnerId,
+          status: 'finished',
+          updated_at: new Date().toISOString()
+        });
+        publishFn({ type: 'match:update', match: resolved });
+      } catch (e) {
+        try { console.warn('[sim] publishFn threw on resolve', e && e.message ? e.message : e); } catch (_) {}
+      }
     }, resolveDelayMs);
   }
 
-  // initial burst
+  // initial burst to populate feed quickly
   for (let i = 0; i < Math.min(3, bots.length); i++) {
     setTimeout(() => { createAndResolve().catch(() => {}); }, i * 300);
   }
@@ -121,16 +134,16 @@ async function startSimulator(publishFn, options = {}) {
   return { stop, bots };
 }
 
-// CLI run
+// CLI run: logs events to stdout
 if (require.main === module) {
   (async () => {
-    console.log('[sim] Starting in-memory simulator (CLI mode). It will log events to stdout.');
+    console.log('[sim] Starting in-memory simulator (CLI mode). Events will be logged to stdout.');
     const runner = await startSimulator((payload) => {
-      console.log('[sim:event]', JSON.stringify(payload));
+      try { console.log('[sim:event]', JSON.stringify(payload)); } catch (e) { console.log('[sim:event]'); }
     }, {});
     process.on('SIGINT', () => { console.log('[sim] stopping'); runner.stop(); process.exit(0); });
     process.on('SIGTERM', () => { console.log('[sim] stopping'); runner.stop(); process.exit(0); });
-  })().catch((err) => { console.error('[sim] fatal', err); process.exit(1); });
+  })().catch((err) => { console.error('[sim] fatal', err && err.stack ? err.stack : err); process.exit(1); });
 }
 
 module.exports = { startSimulator };

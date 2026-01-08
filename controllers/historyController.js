@@ -1,8 +1,14 @@
 // src/controllers/historyController.js
-// History controller with SSE and optional in-process simulator start.
-// If START_SIMULATOR_IN_PROCESS is "true", the controller will require and start the simulator module.
-// Ensure this is only enabled in controlled environments (dev/staging) or behind proper safeguards.
+// Match history controller with SSE and optional in-memory simulator integration.
+// - Returns public match rows for API consumers
+// - SSE endpoint broadcasts real-time updates to connected clients
+// - In-memory simulator (optional) generates simulated matches and publishes them directly to SSE clients
+// - getRecentMatches merges recent simulated matches (in-memory) with DB rows so polling clients see simulated activity
+//
+// Enable in-memory simulator by setting START_IN_MEMORY_SIMULATOR=true in the server environment.
+// NOTE: Running the simulator in-process is intended for dev/staging only unless you explicitly allow it in production.
 
+const path = require('path');
 const { getPool } = require('../config/db');
 const matchModel = require('../models/matchModel');
 const userModel = require('../models/userModel');
@@ -10,73 +16,45 @@ const userModel = require('../models/userModel');
 const DEFAULT_LIMIT = 12;
 const MAX_LIMIT = 100;
 const SSE_PING_MS = 25000;
-const REDIS_CHANNEL = process.env.MATCHES_PUBSUB_CHANNEL || 'matches:updates';
 
-let redisSubscriber = null;
-let sseClients = new Set(); // each item: { id: string, res: http.ServerResponse }
+// SSE clients set: each item { id: string, res: http.ServerResponse }
+const sseClients = new Set();
 
-/* SSE helper */
+// In-memory buffer for recent simulated matches (public rows). Newest first.
+const simulatedBuffer = [];
+const SIM_BUFFER_MAX = 50; // keep a short buffer to merge into recent feed
+
+// Helper: send SSE event
 function sendSse(res, event, data, id) {
   try {
-    if (id) res.write(`id: ${id}\n`);
+    if (id !== undefined && id !== null) res.write(`id: ${id}\n`);
     if (event) res.write(`event: ${event}\n`);
     res.write(`data: ${JSON.stringify(data)}\n\n`);
-  } catch (e) {}
+  } catch (e) {
+    // ignore write errors
+  }
 }
 
-function broadcastMatchUpdate(payload) {
-  if (!payload) return;
+// Broadcast a public match row to all connected SSE clients
+function broadcastMatchUpdate(publicRow) {
+  if (!publicRow) return;
   for (const client of sseClients) {
     try {
-      sendSse(client.res, 'match:update', payload, payload.id || null);
-    } catch (e) {}
+      sendSse(client.res, 'match:update', publicRow, publicRow.id || null);
+    } catch (e) {
+      // ignore per-client errors
+    }
   }
 }
 
-/* Redis subscriber init */
-async function initRedisSubscriber() {
-  const url = process.env.REDIS_URL || process.env.REDIS;
-  if (!url) return;
-  try {
-    const IORedis = require('ioredis');
-    redisSubscriber = new IORedis(url, { lazyConnect: true });
-    redisSubscriber.on('error', (err) => {
-      console.warn('Redis subscriber error', err && err.message ? err.message : err);
-    });
-    await redisSubscriber.connect();
-    await redisSubscriber.subscribe(REDIS_CHANNEL);
-    redisSubscriber.on('message', (channel, message) => {
-      if (!message) return;
-      try {
-        const parsed = JSON.parse(message);
-        const match = parsed.match || parsed;
-        if (match) {
-          const publicRow = {
-            id: match.id,
-            creator_id: match.creator_id || null,
-            creator_display_name: match.creator_display_name || match.creator_username || null,
-            opponent_id: match.opponent_id || null,
-            opponent_display_name: match.opponent_display_name || match.opponent_username || null,
-            bet_amount: match.bet_amount != null ? Number(match.bet_amount) : null,
-            timestamp: match.updated_at || match.created_at || Date.now(),
-            winner: match.winner != null ? match.winner : null,
-            status: match.status || null,
-            _simulated: !!match._simulated || !!match.simulated || false
-          };
-          broadcastMatchUpdate(publicRow);
-        }
-      } catch (e) {
-        console.warn('Failed to parse redis message', e && e.message ? e.message : e);
-      }
-    });
-    console.log('Redis subscriber connected to', REDIS_CHANNEL);
-  } catch (e) {
-    console.warn('Could not initialize Redis subscriber for match updates:', e && e.message ? e.message : e);
-    redisSubscriber = null;
-  }
+// Add a simulated public row to the in-memory buffer (newest first)
+function pushSimulatedBuffer(publicRow) {
+  if (!publicRow) return;
+  simulatedBuffer.unshift(publicRow);
+  if (simulatedBuffer.length > SIM_BUFFER_MAX) simulatedBuffer.length = SIM_BUFFER_MAX;
 }
 
-/* Bulk user fetch */
+// Bulk fetch users by ids using a single query
 async function fetchUsersByIds(ids = []) {
   const map = {};
   if (!Array.isArray(ids) || ids.length === 0) return map;
@@ -101,10 +79,13 @@ function toPublicMatchRow(row) {
     bet_amount: row.bet_amount != null ? Number(row.bet_amount) : null,
     timestamp: row.updated_at || row.created_at || row.updatedAt || row.createdAt || null,
     winner: row.winner != null ? row.winner : null,
-    status: row.status || null
+    status: row.status || null,
+    // preserve any simulated flag if present
+    _simulated: row._simulated || row.simulated || false
   };
 }
 
+// Resolve display names for rows using bulk user lookup
 async function resolveNamesForRows(rows) {
   if (!Array.isArray(rows) || rows.length === 0) return [];
   const ids = new Set();
@@ -127,6 +108,7 @@ async function resolveNamesForRows(rows) {
         if (ou) out.opponent_display_name = ou.displayName || ou.username || ('#' + out.opponent_id);
       }
 
+      // Normalize winner: numeric id -> 'creator'/'opponent' when possible
       if (out.winner != null) {
         const w = String(out.winner).trim();
         if (/^\d+$/.test(w)) {
@@ -138,13 +120,75 @@ async function resolveNamesForRows(rows) {
           out.winner = w.toLowerCase();
         }
       }
-    } catch (e) {}
+    } catch (e) {
+      // swallow mapping errors
+    }
     return out;
   });
 }
 
-/* Controller endpoints */
+/**
+ * GET /api/history/recent
+ * Merge DB recent rows with in-memory simulated rows so polling clients see simulated activity.
+ */
+async function getRecentMatches(req, res) {
+  try {
+    const limit = Math.min(MAX_LIMIT, Math.max(1, Number(req.query.limit || DEFAULT_LIMIT)));
+    const offset = Math.max(0, Number(req.query.offset || 0));
 
+    const pool = await getPool();
+    try {
+      const [rows] = await pool.query(
+        `SELECT id,
+                creator_id, creator_display_name, creator_username,
+                opponent_id, opponent_display_name, opponent_username,
+                bet_amount, status, winner,
+                created_at, updated_at
+         FROM matches
+         ORDER BY updated_at DESC
+         LIMIT ? OFFSET ?`,
+        [limit, offset]
+      );
+
+      const publicRows = await resolveNamesForRows(rows || []);
+
+      // Merge simulatedBuffer (newest first) with DB rows, dedupe by id, and cap to limit
+      const merged = [];
+      const seen = new Set();
+
+      // include simulated rows first
+      for (const s of simulatedBuffer) {
+        if (merged.length >= limit) break;
+        const sid = s && s.id ? String(s.id) : null;
+        if (sid && seen.has(sid)) continue;
+        if (sid) seen.add(sid);
+        merged.push(s);
+      }
+
+      // then include DB rows
+      for (const r of publicRows) {
+        if (merged.length >= limit) break;
+        const rid = r && r.id ? String(r.id) : null;
+        if (rid && seen.has(rid)) continue;
+        if (rid) seen.add(rid);
+        merged.push(r);
+      }
+
+      return res.json({ matches: merged, meta: { limit, offset, count: merged.length } });
+    } catch (e) {
+      console.error('getRecentMatches error', e && e.message ? e.message : e);
+      return res.status(500).json({ error: 'Server error' });
+    }
+  } catch (err) {
+    console.error('getRecentMatches outer error', err && err.stack ? err.stack : err);
+    return res.status(500).json({ error: 'Server error' });
+  }
+}
+
+/**
+ * GET /api/history/matches
+ * List matches for authenticated user (unchanged)
+ */
 async function listUserMatches(req, res) {
   try {
     const user = req.user;
@@ -171,6 +215,10 @@ async function listUserMatches(req, res) {
   }
 }
 
+/**
+ * GET /api/history/:id
+ * Return single match; owners/admins get full row, others get public row
+ */
 async function getMatchHistory(req, res) {
   try {
     const id = Number(req.params.id || req.query.id);
@@ -210,6 +258,9 @@ async function getMatchHistory(req, res) {
   }
 }
 
+/**
+ * GET /api/history/matches/:id/moves
+ */
 async function getMatchMoves(req, res) {
   try {
     const matchId = Number(req.params.id || req.query.id);
@@ -239,40 +290,13 @@ async function getMatchMoves(req, res) {
   }
 }
 
-async function getRecentMatches(req, res) {
-  try {
-    const limit = Math.min(MAX_LIMIT, Math.max(1, Number(req.query.limit || DEFAULT_LIMIT)));
-    const offset = Math.max(0, Number(req.query.offset || 0));
-
-    const pool = await getPool();
-    try {
-      const [rows] = await pool.query(
-        `SELECT id,
-                creator_id, creator_display_name, creator_username,
-                opponent_id, opponent_display_name, opponent_username,
-                bet_amount, status, winner,
-                created_at, updated_at
-         FROM matches
-         ORDER BY updated_at DESC
-         LIMIT ? OFFSET ?`,
-        [limit, offset]
-      );
-
-      const publicRows = await resolveNamesForRows(rows || []);
-      return res.json({ matches: publicRows, meta: { limit, offset, count: publicRows.length } });
-    } catch (e) {
-      console.error('getRecentMatches error', e && e.message ? e.message : e);
-      return res.status(500).json({ error: 'Server error' });
-    }
-  } catch (err) {
-    console.error('getRecentMatches outer error', err && err.stack ? err.stack : err);
-    return res.status(500).json({ error: 'Server error' });
-  }
-}
-
-/* SSE stream endpoint */
+/**
+ * SSE stream endpoint
+ * GET /api/history/stream?matchId=...
+ */
 async function streamMatchHistory(req, res) {
   try {
+    // optional auth check can be added by middleware before this handler
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache, no-transform',
@@ -281,6 +305,7 @@ async function streamMatchHistory(req, res) {
     });
     res.write('\n');
 
+    // optional initial snapshot for a specific match
     const matchId = req.query && req.query.matchId ? Number(req.query.matchId) : null;
     if (matchId && Number.isInteger(matchId) && matchId > 0) {
       try {
@@ -298,10 +323,12 @@ async function streamMatchHistory(req, res) {
       }
     }
 
+    // register client
     const clientId = Date.now() + '-' + Math.random().toString(36).slice(2, 9);
     const client = { id: clientId, res };
     sseClients.add(client);
 
+    // ping to keep connection alive
     const ping = setInterval(() => {
       try {
         res.write(`event: ping\n`);
@@ -320,7 +347,10 @@ async function streamMatchHistory(req, res) {
   }
 }
 
-/* Internal publish endpoint (protect this route) */
+/**
+ * Internal publish endpoint for other services (protected by route middleware)
+ * POST /api/history/publish { match: {...} }
+ */
 async function publishMatchUpdate(req, res) {
   try {
     const payload = req.body && req.body.match ? req.body.match : req.body;
@@ -339,17 +369,9 @@ async function publishMatchUpdate(req, res) {
       _simulated: payload._simulated || payload.simulated || false
     };
 
-    // Broadcast locally
+    // broadcast and also push to simulated buffer if flagged simulated
     broadcastMatchUpdate(publicRow);
-
-    // Also publish to Redis for other instances (best-effort)
-    try {
-      if (redisSubscriber && typeof redisSubscriber.publish === 'function') {
-        await redisSubscriber.publish(REDIS_CHANNEL, JSON.stringify({ match: publicRow }));
-      }
-    } catch (e) {
-      // ignore
-    }
+    if (publicRow._simulated) pushSimulatedBuffer(publicRow);
 
     return res.json({ ok: true });
   } catch (e) {
@@ -358,58 +380,92 @@ async function publishMatchUpdate(req, res) {
   }
 }
 
-/* Initialize Redis subscriber on module load (best-effort) */
-initRedisSubscriber().catch((e) => {
-  console.warn('initRedisSubscriber failed', e && e.message ? e.message : e);
-});
+/* ---------------------------
+   In-memory simulator integration
+   --------------------------- */
 
-/* Optionally start simulator in-process (guarded) */
-(async function maybeStartSimulatorInProcess() {
+let simRunner = null;
+let simModule = null;
+
+// Try to require the in-memory simulator module if present
+try {
+  simModule = require(path.join(__dirname, '..', 'scripts', 'simulateMatchesInMemory.js'));
+} catch (e) {
+  // module optional; log at debug level
+  // console.warn('simulateMatchesInMemory module not found; in-memory simulator disabled.');
+  simModule = null;
+}
+
+// Handler that simulator will call with payloads { type, match }
+function handleSimulatorPayload(payload) {
   try {
-    const startInProcess = String(process.env.START_SIMULATOR_IN_PROCESS || '').toLowerCase();
-    if (startInProcess === 'true' || startInProcess === '1') {
-      // Only allow in non-production by default unless explicitly allowed
-      const allowInProd = String(process.env.START_SIMULATOR_IN_PROD || '').toLowerCase() === 'true';
-      if (process.env.NODE_ENV === 'production' && !allowInProd) {
-        console.warn('START_SIMULATOR_IN_PROCESS requested but NODE_ENV=production and START_SIMULATOR_IN_PROD not true. Skipping.');
+    if (!payload) return;
+    const match = payload.match || payload;
+    const publicRow = {
+      id: match.id,
+      creator_id: match.creator_id || null,
+      creator_display_name: match.creator_display_name || match.creator_username || null,
+      opponent_id: match.opponent_id || null,
+      opponent_display_name: match.opponent_display_name || match.opponent_username || null,
+      bet_amount: match.bet_amount != null ? Number(match.bet_amount) : null,
+      timestamp: match.updated_at || match.created_at || Date.now(),
+      winner: match.winner != null ? match.winner : null,
+      status: match.status || null,
+      _simulated: true
+    };
+
+    // broadcast to SSE clients and push to buffer
+    broadcastMatchUpdate(publicRow);
+    pushSimulatedBuffer(publicRow);
+  } catch (e) {
+    console.warn('handleSimulatorPayload error', e && e.message ? e.message : e);
+  }
+}
+
+// Optionally start in-memory simulator in-process (guarded by env var)
+(async function maybeStartInMemorySimulator() {
+  try {
+    const startSim = String(process.env.START_IN_MEMORY_SIMULATOR || '').toLowerCase();
+    if (startSim === 'true' || startSim === '1') {
+      // avoid starting in production unless explicitly allowed
+      if (process.env.NODE_ENV === 'production' && String(process.env.START_IN_MEMORY_SIMULATOR_IN_PROD || '').toLowerCase() !== 'true') {
+        console.warn('START_IN_MEMORY_SIMULATOR requested but NODE_ENV=production and START_IN_MEMORY_SIMULATOR_IN_PROD not true. Skipping.');
         return;
       }
 
-      // require simulator module and start it
+      if (!simModule || typeof simModule.startSimulator !== 'function') {
+        console.warn('In-memory simulator module not available; ensure scripts/simulateMatchesInMemory.js exists and exports startSimulator.');
+        return;
+      }
+
+      if (simRunner) return; // already started
+
+      const simOptions = {
+        intervalMs: Number(process.env.SIM_INTERVAL_MS || 60 * 1000),
+        resolveDelayMs: Number(process.env.SIM_RESOLVE_DELAY_MS || 5 * 1000),
+        minStake: Number(process.env.SIM_MIN_STAKE || 10),
+        maxStake: Number(process.env.SIM_MAX_STAKE || 2000),
+        botCount: Number(process.env.SIM_BOT_COUNT || 30),
+        namePool: undefined // optional: pass custom pool via env or code
+      };
+
       try {
-        const simModule = require(path.join(__dirname, '..', 'scripts', 'simulateMatches.js'));
-        if (simModule && typeof simModule.startSimulator === 'function') {
-          const simOptions = {
-            // pass through useful env vars
-            SIM_INTERVAL_MS: Number(process.env.SIM_INTERVAL_MS || 60000),
-            SIM_RESOLVE_DELAY_MS: Number(process.env.SIM_RESOLVE_DELAY_MS || 5000),
-            SIM_MIN_STAKE: Number(process.env.SIM_MIN_STAKE || 10),
-            SIM_MAX_STAKE: Number(process.env.SIM_MAX_STAKE || 2000),
-            SIM_BOT_COUNT: Number(process.env.SIM_BOT_COUNT || 100),
-            REDIS_URL: process.env.REDIS_URL || process.env.REDIS,
-            REDIS_CHANNEL: process.env.MATCHES_PUBSUB_CHANNEL || REDIS_CHANNEL,
-            HIT_PUBLISH_URL: process.env.HIT_PUBLISH_URL || null,
-            INTERNAL_SECRET: process.env.INTERNAL_PUBLISH_SECRET || ''
-          };
-          const simController = await simModule.startSimulator(simOptions);
-          console.log('Simulator started in-process.');
-          // store stop handle if needed
-          if (simController && typeof simController.stop === 'function') {
-            process.on('SIGINT', () => { try { simController.stop(); } catch (e) {} });
-            process.on('SIGTERM', () => { try { simController.stop(); } catch (e) {} });
-          }
-        } else {
-          console.warn('Simulator module found but startSimulator not exported.');
-        }
+        const runner = await simModule.startSimulator(handleSimulatorPayload, simOptions);
+        simRunner = runner;
+        console.log('In-memory simulator started in-process.');
+        // ensure graceful shutdown stops simulator
+        process.on('SIGINT', () => { try { simRunner && simRunner.stop(); } catch (e) {} });
+        process.on('SIGTERM', () => { try { simRunner && simRunner.stop(); } catch (e) {} });
       } catch (e) {
-        console.warn('Failed to start simulator in-process:', e && e.message ? e.message : e);
+        console.warn('Failed to start in-memory simulator', e && e.message ? e.message : e);
       }
     }
   } catch (e) {
-    console.warn('maybeStartSimulatorInProcess error', e && e.message ? e.message : e);
+    console.warn('maybeStartInMemorySimulator error', e && e.message ? e.message : e);
   }
 })();
 
+/* Export controller functions */
 module.exports = {
   listUserMatches,
   getMatchHistory,
